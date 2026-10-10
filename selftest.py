@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -684,6 +685,119 @@ def case_input_limits(root: str) -> None:
     )
 
 
+def case_shared_initialization(root: str) -> None:
+    env = env_for(root)
+    s = session(SESSION_A, "pane-a", "win-a", "tern-a", "Alpha", root)
+
+    # A first-use request must wait out a held write transaction instead of
+    # failing on a journal-mode change: initialisation acquires its write lock
+    # with BEGIN IMMEDIATE, which honours busy_timeout.
+    holder = sqlite3.connect(os.path.join(root, "media.db"), timeout=0, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    boot = subprocess.Popen(
+        [sys.executable, BACKEND],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    boot.stdin.write(json.dumps({"op": "touch", "session": s}))
+    boot.stdin.close()
+    boot.stdin = None
+    time.sleep(1.0)
+    holder.execute("ROLLBACK")
+    holder.close()
+    boot_out = ""
+    try:
+        boot_out, _ = boot.communicate(timeout=40)
+        code = boot.returncode
+    except subprocess.TimeoutExpired:
+        boot.kill()
+        code = None
+        boot.communicate()
+    try:
+        booted = json.loads(boot_out) if boot_out.strip() else None
+    except ValueError:
+        booted = None
+    check(
+        "a first-use request waits out a held writer instead of failing",
+        code == 0 and isinstance(booted, dict) and booted.get("ok") is True,
+        "%s %s" % (code, booted),
+    )
+
+    # Several initial refresh requests race the same empty state directory.
+    fresh = fresh_state("concurrent")
+    race_env = env_for(fresh)
+    requests = [
+        {
+            "op": "touch",
+            "session": session(
+                "%08d-0000-4000-8000-000000000000" % i,
+                "pane-%d" % i,
+                "win-%d" % i,
+                "tern-%d" % i,
+                "R%d" % i,
+                fresh,
+            ),
+        }
+        for i in range(6)
+    ]
+    procs = [
+        subprocess.Popen(
+            [sys.executable, BACKEND],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=race_env,
+        )
+        for _ in requests
+    ]
+    for proc, request in zip(procs, requests):
+        try:
+            proc.stdin.write(json.dumps(request))
+            proc.stdin.close()
+            proc.stdin = None
+        except BrokenPipeError:
+            pass
+    outcomes = []
+    for proc in procs:
+        out, _ = proc.communicate(timeout=120)
+        try:
+            parsed = json.loads(out)
+        except ValueError:
+            parsed = None
+        outcomes.append(proc.returncode == 0 and isinstance(parsed, dict) and parsed.get("ok") is True)
+    check("racing first-use requests all succeed", all(outcomes), str(outcomes))
+
+    _, listed = call({"op": "list", "scope": "all"}, race_env)
+    check(
+        "each racing session is stored exactly once",
+        bool(listed) and listed.get("ok") and {row["id"] for row in listed["sessions"]}
+        == {request["session"]["id"] for request in requests},
+        str(listed and listed.get("sessions")),
+    )
+
+    # An initialised store answers read/list without re-running writes, so a
+    # concurrent writer cannot block it.
+    _, stored = register(env, s, [{"path": write_file(root, "coexist.png", make_png((7, 7, 7))), "source": "viewed"}])
+    holder = sqlite3.connect(os.path.join(root, "media.db"), timeout=0, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        code, listed = call({"op": "list", "scope": "all"}, env, timeout=15)
+        check(
+            "read/list coexists with a held write transaction",
+            code == 0 and bool(listed) and listed.get("ok") and listed["total"] == 1,
+            str(listed),
+        )
+    except subprocess.TimeoutExpired:
+        check("read/list coexists with a held write transaction", False, "backend blocked on a held writer")
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
 def _b64(payload: bytes) -> str:
     import base64
 
@@ -708,6 +822,7 @@ def main() -> int:
         ("transcript backfill", case_backfill),
         ("binding order", case_binding_order),
         ("legacy migration", case_legacy_migration),
+        ("shared initialization", case_shared_initialization),
         ("input limits", case_input_limits),
     )
     try:

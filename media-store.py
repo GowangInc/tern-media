@@ -48,6 +48,9 @@ MAX_BACKFILL_IMAGES = 200
 MAX_BACKFILL_PATHS = 200
 PREVIEW_PX = 512
 SQLITE_TIMEOUT_S = 30.0
+# Bumped only when the schema changes. Stored in PRAGMA user_version so a
+# schema-current database is opened without a single write statement.
+SCHEMA_VERSION = 1
 TOOL_TIMEOUT_S = 20
 VALID_SOURCES = ("created", "transferred", "viewed", "tagged")
 DEFAULT_SOURCE = "viewed"
@@ -178,73 +181,99 @@ def private_file(path: str) -> str:
     return path
 
 
+SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL DEFAULT '',
+        cwd TEXT NOT NULL DEFAULT '',
+        host TEXT NOT NULL DEFAULT '',
+        pane_id TEXT NOT NULL DEFAULT '',
+        window_key TEXT NOT NULL DEFAULT '',
+        tern_session_id TEXT NOT NULL DEFAULT '',
+        tern_session_name TEXT NOT NULL DEFAULT '',
+        touched_at TEXT NOT NULL,
+        bound_at TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        path TEXT,
+        source_key TEXT NOT NULL,
+        stored_path TEXT NOT NULL,
+        preview_path TEXT,
+        sha256 TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        source TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        tags TEXT NOT NULL DEFAULT '[]',
+        version INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS items_dedupe ON items (session_id, source_key, sha256)",
+    "CREATE INDEX IF NOT EXISTS items_session ON items (session_id, id DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS watches (
+        session_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (session_id, path)
+    )
+    """,
+)
+
+
+def initialize_schema(conn: sqlite3.Connection) -> None:
+    """Bring a database to the current schema, exactly once.
+
+    A single BEGIN IMMEDIATE serialises competing first-use processes through
+    busy_timeout instead of letting them race the schema, and the user_version
+    guard means a process that loses the race performs no writes at all.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+            conn.execute("COMMIT")
+            return
+        for statement in SCHEMA_STATEMENTS:
+            conn.execute(statement)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if "bound_at" not in columns:
+            # Databases written before bound_at existed ordered pane bindings
+            # by touched_at; seed that order once so pre-migration state keeps
+            # resolving. No row is rewritten or removed otherwise.
+            conn.execute("ALTER TABLE sessions ADD COLUMN bound_at TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE sessions SET bound_at = touched_at WHERE bound_at = ''")
+        try:
+            # Versions must be unique per retained source; the insert computes
+            # the next version inside the same statement that writes it.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS items_version ON items (session_id, source_key, version)"
+            )
+        except sqlite3.IntegrityError:
+            pass  # a state dir with pre-existing duplicate versions keeps working
+        conn.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
 def connect(root: str) -> sqlite3.Connection:
     private_dir(root)
     db_path = os.path.join(root, "media.db")
     conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT_S, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = %d" % int(SQLITE_TIMEOUT_S * 1000))
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            label TEXT NOT NULL DEFAULT '',
-            cwd TEXT NOT NULL DEFAULT '',
-            host TEXT NOT NULL DEFAULT '',
-            pane_id TEXT NOT NULL DEFAULT '',
-            window_key TEXT NOT NULL DEFAULT '',
-            tern_session_id TEXT NOT NULL DEFAULT '',
-            tern_session_name TEXT NOT NULL DEFAULT '',
-            touched_at TEXT NOT NULL,
-            bound_at TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            path TEXT,
-            source_key TEXT NOT NULL,
-            stored_path TEXT NOT NULL,
-            preview_path TEXT,
-            sha256 TEXT NOT NULL,
-            mime TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            source TEXT NOT NULL,
-            recorded_at TEXT NOT NULL,
-            tags TEXT NOT NULL DEFAULT '[]',
-            version INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS items_dedupe
-            ON items (session_id, source_key, sha256);
-        CREATE INDEX IF NOT EXISTS items_session ON items (session_id, id DESC);
-        CREATE TABLE IF NOT EXISTS watches (
-            session_id TEXT NOT NULL,
-            path TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (session_id, path)
-        );
-        """
-    )
-    # Autocommit means every statement below is its own transaction, so a
-    # concurrent writer can never observe a half-applied insert.
-    try:
-        # Versions must be unique per retained source; the insert computes the
-        # next version inside the same statement that writes it.
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS items_version ON items (session_id, source_key, version)"
-        )
-    except sqlite3.Error:
-        pass  # a state dir with pre-existing duplicate versions keeps working
-    try:
-        conn.execute("ALTER TABLE sessions ADD COLUMN bound_at TEXT NOT NULL DEFAULT ''")
-        # Databases written before bound_at existed ordered pane bindings by
-        # touched_at; seed that order once so pre-migration state keeps
-        # resolving. No row is rewritten or removed otherwise.
-        conn.execute("UPDATE sessions SET bound_at = touched_at WHERE bound_at = ''")
-    except sqlite3.Error:
-        pass  # fresh databases already declare the column
+    # Opening a current schema performs no DDL, migration or journal changes.
+    # Existing journal modes are preserved; new databases use SQLite's default.
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        initialize_schema(conn)
     private_file(db_path)
     return conn
 

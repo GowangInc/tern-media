@@ -80,6 +80,14 @@ Source code and media data are separate. Default store:
 
 The store contains SQLite metadata, immutable originals, and cached previews. It uses owner-only directories/files. No network service is started. The extension is inert outside Tern (`TERN_PANE` must be present). Publication excludes media, databases, transcripts, credentials, and verification screenshots. Do not put your media store inside the source checkout.
 
+Schema creation and migration run once inside a serialized transaction. Normal opens do not rerun schema writes or change the journal mode; existing databases keep their mode, and new databases use SQLite's defaults.
+
+## Runtime troubleshooting
+
+If Tern reports `focus exceeded 50 ms`, `title exceeded 50 ms`, or another plugin hook budget error, it disables the affected handler until **Reload plugins** in the command palette. `tern plugin list` reporting `ready` describes package loading, not whether every window handler is still enabled.
+
+An intermittent hook timeout was observed on Tern 0.7.0 after the initial isolated verification. Its cause remains unresolved: a tiny diagnostic handler also timed out when loaded alongside Media, but succeeded in a separate minimal window. Reloading restores disabled handlers; it is recovery, not a permanent fix. The safety limit is unchanged.
+
 ## Checks
 
 ```sh
