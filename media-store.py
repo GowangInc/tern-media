@@ -10,8 +10,8 @@ its older version instead of replacing it.
 table and imports the transcript that process holds open, so media an open
 conversation already carries appears without a manual import. A resumed
 conversation idling between turns holds no transcript open; it is resolved
-through the terminal breadcrumb OMP stamps on every create/switch/resume,
-proven against the live process's own controlling tty and birth time.
+through OMP's terminal breadcrumb, verified against the live process's tty
+and birth time, or its exact absolute resume argument for an older pointer.
 
 State lives outside the plugin: TERN_MEDIA_STATE_DIR, else
 ~/Library/Application Support/Tern/media (macOS), else
@@ -160,9 +160,9 @@ OMP_BLOB_DIR = os.path.join(os.path.expanduser("~"), ".omp", "agent", "blobs")
 # are ever considered a conversation, so a stray JSONL elsewhere on the machine
 # can never be imported into a pane.
 OMP_SESSIONS_DIR = os.path.join(os.path.dirname(OMP_BLOB_DIR), "sessions")
-# OMP's terminal breadcrumbs, one file per terminal, stamped synchronously on
-# every session create/switch/resume. A resumed-but-idle OMP holds no
-# transcript open, so this pointer is the only live proof of its conversation.
+# OMP's terminal breadcrumbs, one file per terminal. Idle sessions close their
+# transcript, so discovery verifies this pointer against the live process;
+# some builds preserve an unchanged pointer when resuming the same file.
 OMP_TERMINAL_SESSIONS_DIR = os.path.join(os.path.dirname(OMP_BLOB_DIR), "terminal-sessions")
 # The foreground command the Tern CLI reports for OMP. Some builds report a
 # version string in `name` instead of the command, so argv is checked too.
@@ -1266,8 +1266,8 @@ def is_omp_process(foreground: dict) -> bool:
 def open_transcript_paths(pid: int) -> list[str] | None:
     """The transcript files one process holds open, or None when it cannot be read.
 
-    A conversation is only ever identified by what its own process has open, so
-    no name, timestamp or directory listing can substitute for a live session.
+    This path uses only the process's own file table: a filename, timestamp or
+    directory listing never substitutes for an open transcript.
     """
     fd_dir = "/proc/%d/fd" % pid
     paths: list[str] = []
