@@ -23,7 +23,7 @@ In Tern's command palette, choose **Media: Open session gallery**. It opens besi
 - **Archived sessions** lets you reopen an indexed conversation after its terminal closes.
 - Filter by media kind, or search filenames and tags. Each item shows its timestamp, provenance, conversation, and retained version.
 - Select two images, assign **A** and **B**, then choose **Compare** for side-by-side retained versions. Narrow panes stack the comparison.
-- **Open retained original** opens the immutable saved copy, not the mutable source file.
+- **View original** (or **Enter / O**) loads the immutable saved image in Tern's native full-resolution viewer, with zoom and pan. Comparison slots have their own **View original A / B** links. It never opens the mutable source file.
 - **Import file** accepts a literal host-local path, including spaces. **Watch directory** explicitly associates a nonrecursive directory with this conversation. Stop a watch from the gallery.
 
 While the gallery is focused:
@@ -34,7 +34,8 @@ While the gallery is focused:
 | A / B / C | Assign comparison slots / toggle comparison |
 | T | Edit selected item's comma-separated tags |
 | / | Search names and tags |
-| I / W / O | Import file / watch directory / open saved original |
+| I / W | Import file / watch directory |
+| Enter / O (outside an edit) | View the selected retained original |
 | P / H | Pin or follow / show archived sessions |
 | S / K | Cycle scope / media kind |
 | R | Refresh |
@@ -73,7 +74,7 @@ The backend stores original bytes by SHA-256. Repeated observations of identical
 
 Only observed versions can be retained. Rapid intermediate overwrites between watch scans cannot be recovered. Watched directories are nonrecursive; hidden entries, symlinks, and nonregular files are excluded. Images, video, audio, and PDF files are supported, with a 64 MiB original-file limit and bounded inline payload/backfill processing.
 
-Image/video thumbnails use the installed platform decoder (`sips` on macOS, or `ffmpeg`). Missing codecs or preview tools do not discard the original: the gallery shows a type card and offers the saved file. Saved audio, video, and PDFs use Tern's normal file handling, which may delegate unsupported formats to an external viewer. The gallery has no embedded player.
+Image/video thumbnails use the installed platform decoder (`sips` on macOS, or `ffmpeg`). Inline gallery images and their thumbnail lightboxes are bounded previews; **View original** loads the retained image's full resolution in a native file block instead. Missing codecs or preview tools do not discard the original: the gallery shows a type card and offers the saved file. Saved audio, video, and PDFs use Tern's normal file handling, which may delegate unsupported formats to an external viewer. The gallery has no embedded player.
 
 ## Local data
 
@@ -102,7 +103,7 @@ bun omp-extension.ts --self-check
 
 The backend check exercises real JSON subprocess requests, retained bytes/versioning, conversation/workspace isolation, imports, watches, transcript/blob backfill, live-process and cold-resume discovery, stale-pointer rejection, and input boundaries. Bun checks automatic historical import, delayed-media availability, and binding order in an isolated store and child-process environment. Check fixtures are retained in temporary directories printed by the commands. Bun is only needed for the standalone extension check, not for the Python store.
 
-Native checks isolate Tern configuration, daemon, media/Flow stores, and OMP state. Generated fixture images exercise gallery opening, existing-session import, Escape closure and persistence, comparison, tagging/search, import/watch, pin persistence, typed saved-file opening, floating/docking, and narrow/light/dark layouts. An actual OMP image read verifies the capture path separately.
+Native checks isolate Tern configuration, daemon, media/Flow stores, and OMP state. Generated fixture images exercise gallery opening, existing-session import, Escape closure and persistence, comparison, tagging/search, import/watch, pin persistence, typed saved-file opening, floating/docking, and narrow/light/dark layouts. Original-view checks load 3200×2400 and 1800×900 retained images through keyboard and native links, including a comparison original after the source is overwritten. An actual OMP image read verifies the capture path separately.
 
 ## License and acknowledgements
 

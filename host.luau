@@ -359,9 +359,6 @@ local function action(s, act, value, cx)
     elseif act == "open" then
         local item = chosen(s)
         if item then cx:open(item.stored_path) end
-    elseif act == "open-a" or act == "open-b" then
-        local item = s.compare[act == "open-a" and "A" or "B"]
-        if item then cx:open(item.stored_path) end
     elseif act == "archives" then s.archives = not s.archives
     elseif act == "archive-prev" then s.archiveOffset = math.max(0, s.archiveOffset - 8)
     elseif act == "archive-next" and s.archiveOffset + 8 < #s.sessions then s.archiveOffset += 8
@@ -404,13 +401,14 @@ local function imageView(s, item, size)
     return text(string.upper(item.kind) .. " · no thumbnail · open retained original", "muted")
 end
 
-local function preview(s, item, label, openAction)
+-- ponytail: native file links provide full-resolution zoom/pan without large gallery blobs.
+local function preview(s, item, label)
     if not item then return column("media-slot", {text(label .. " · Select an image, then assign " .. label, "muted")}) end
     return column("media-slot", {
         text(label .. " · " .. item.name .. " · v" .. tostring(item.version), "strong"),
         imageView(s, item, 1200),
         text(item.recorded_at .. " · " .. item.session_label, "muted"),
-        button("Open retained " .. label, openAction),
+        ui.text(ui.link("View original " .. label, item.stored_path)),
     })
 end
 
@@ -511,7 +509,7 @@ tern.block.define("gallery", {
             if item then selectItem(s, item.id, cx) end
             return item ~= nil
         end
-        local shortcuts = {r = "refresh", a = "compare-a", b = "compare-b", c = "compare", t = "tags", i = "import", w = "watch", o = "open", ["/"] = "search", ["["] = "previous", ["]"] = "next", p = s.pin and "follow" or "pin", h = "archives"}
+        local shortcuts = {r = "refresh", a = "compare-a", b = "compare-b", c = "compare", t = "tags", i = "import", w = "watch", o = "open", enter = "open", ["/"] = "search", ["["] = "previous", ["]"] = "next", p = s.pin and "follow" or "pin", h = "archives"}
         if name == "escape" or name == "esc" then
             if s.comparing or s.archives then
                 s.comparing, s.archives = false, false
@@ -557,7 +555,7 @@ tern.block.define("gallery", {
         if s.notice then table.insert(parts, text(s.notice, "muted")) end
         if s.edit then table.insert(parts, editorView(s)) end
         if s.comparing then
-            local slots = {preview(s, s.compare.A, "A", "open-a"), preview(s, s.compare.B, "B", "open-b")}
+            local slots = {preview(s, s.compare.A, "A"), preview(s, s.compare.B, "B")}
             table.insert(parts, column("media-compare", {narrow and ui.col(slots) or ui.row(slots), ui.row({button("Exit compare [Esc]", "compare"), button("Clear A/B", "clear-compare")})}))
         else
             local item = chosen(s)
@@ -568,7 +566,7 @@ tern.block.define("gallery", {
             table.insert(parts, column("media-detail", {
                 text(item.recorded_at .. " · " .. item.source .. " · " .. item.session_label, "muted"),
                 text("Tags: " .. (#item.tags > 0 and table.concat(item.tags, ", ") or "none")),
-                ui.row({button("Open retained [O]", "open"), button("Edit tags [T]", "tags", s.busy)}),
+                ui.row({ui.text(ui.link(item.kind == "image" and "View original [Enter / O]" or "Open retained [O]", item.stored_path)), button("Edit tags [T]", "tags", s.busy)}),
                 ui.row({button("Assign A [A]", "compare-a", item.kind ~= "image"), button("Assign B [B]", "compare-b", item.kind ~= "image"), button(s.comparing and "Show preview" or "Compare A/B [C]", "compare")}),
             }))
         end
@@ -592,7 +590,7 @@ tern.block.define("gallery", {
         end
         return {
             main = ui.col({column("media-gallery", parts)}),
-            dock = ui.col({text("Arrows select · A/B assign · C compare · R refresh · / search · T tags · I import · W watch · O open · P pin/follow · H archives · S scope · K kind · [ / ] page · Esc close", "muted")}),
+            dock = ui.col({text("Enter / O: view original · Arrows select · A/B assign · C compare · R refresh · / search · T tags · I import · W watch · P pin/follow · H archives · S scope · K kind · [ / ] page · Esc close", "muted")}),
         }
     end,
 })
