@@ -40,12 +40,17 @@ While the gallery is focused:
 | R | Refresh |
 | [ / ] | Previous / next page |
 | Enter / Escape | Apply / cancel an edit |
+| Escape (outside an edit) | Leave comparison/archive view, or close the gallery when neither is open |
 
 Click the same controls if you prefer the mouse. The gallery inherits Tern's type and colour palette.
 
 ## Collecting media
 
 Inside Tern, the OMP extension captures image attachments, successful tool-returned media, and clearly named existing local media paths. Image reads retain the original file once rather than creating a second item from the tool's preview. Child-agent media belongs to its parent conversation. Native Tern media file opens and drops are also registered; opening a retained copy from the gallery does not import it again.
+
+Opening or refreshing the gallery discovers existing media from its owning OMP conversation. New, resumed, switched, and branched main sessions also import their existing transcript through the OMP extension. An unchanged, fully imported transcript is skipped on later session events; unresolved media remains eligible for a later import. A child session never imports its parent's history or changes the pane binding.
+
+Discovery follows the owning pane's live OMP process, using its open transcript or a verified terminal breadcrumb when idle. An older breadcrumb is accepted only when it matches that process's exact absolute resume argument. Ambiguous or unproven pointers never select another conversation.
 
 Explicit OMP commands:
 
@@ -58,7 +63,7 @@ Explicit OMP commands:
 /media-backfill /absolute/path/session.jsonl
 ```
 
-Backfill is explicit, never automatic: it imports retained image blocks and existing referenced local media from the selected transcript. Missing references are reported, remote URLs are not downloaded, and transcript bodies are not stored in the media database.
+`/media-backfill` explicitly imports the current or named transcript when needed. Automatic and explicit imports retain image blocks and existing referenced local media. Missing references are reported, remote URLs are not downloaded, and transcript bodies are not stored in the media database.
 
 There is no generic Tern event for every possible media transfer. Arbitrary files created by unrelated programs are not indexed unless opened, explicitly imported, or found in a directory you chose to watch.
 
@@ -95,9 +100,9 @@ python3 selftest.py
 bun omp-extension.ts --self-check
 ```
 
-The backend check exercises real JSON subprocess requests, retained bytes/versioning, conversation/workspace isolation, imports, watches, transcript/blob backfill, and input boundaries. Bun is only needed for the standalone extension check, not for the Python store.
+The backend check exercises real JSON subprocess requests, retained bytes/versioning, conversation/workspace isolation, imports, watches, transcript/blob backfill, live-process and cold-resume discovery, stale-pointer rejection, and input boundaries. Bun checks automatic historical import, delayed-media availability, and binding order in an isolated store and child-process environment. Check fixtures are retained in temporary directories printed by the commands. Bun is only needed for the standalone extension check, not for the Python store.
 
-Native verification uses an isolated Tern configuration/daemon/store and generated fixture images, never live conversation data. It exercises gallery opening, comparison, tagging/search, import/watch, pin persistence, typed saved-file opening, floating/docking, and narrow/light/dark layouts. An actual OMP image read verifies the capture path separately.
+Native checks isolate Tern configuration, daemon, media/Flow stores, and OMP state. Generated fixture images exercise gallery opening, existing-session import, Escape closure and persistence, comparison, tagging/search, import/watch, pin persistence, typed saved-file opening, floating/docking, and narrow/light/dark layouts. An actual OMP image read verifies the capture path separately.
 
 ## License and acknowledgements
 

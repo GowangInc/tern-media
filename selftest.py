@@ -3,7 +3,7 @@
 
 Runs media-store.py exactly the way Tern does: one JSON request on stdin, one
 JSON response on stdout, a fresh process per call. Every case gets its own
-TERN_MEDIA_STATE_DIR under a temp directory that is removed afterwards.
+TERN_MEDIA_STATE_DIR under a retained temp directory, printed after the checks.
 
     python3 selftest.py
 
@@ -15,7 +15,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pty
 import shutil
+import signal
+import socket
 import sqlite3
 import struct
 import subprocess
@@ -113,6 +116,7 @@ def make_png(rgb: tuple[int, int, int], size: int = 4) -> bytes:
 
 
 def write_file(directory: str, name: str, payload: bytes) -> str:
+    os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, name)
     with open(path, "wb") as handle:
         handle.write(payload)
@@ -127,6 +131,193 @@ def plain_errors(entries) -> bool:
     return isinstance(entries, list) and all(
         isinstance(e, dict) and isinstance(e.get("name"), str) and isinstance(e.get("error"), str) for e in entries
     )
+
+
+# Discovery resolves the pane's own live conversation from the process table and
+# the transcripts that process holds open. The checks below therefore run a real
+# holder process and a stand-in `tern` CLI: the backend sees exactly what a host
+# would report, and no check ever touches the real OMP session store.
+
+HOLDER_CODE = (
+    "import os,sys,time\n"
+    "ready, trigger, extra, paths = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]\n"
+    "handles = [open(path, 'rb') for path in paths]\n"
+    "open(ready, 'w').close()\n"
+    "deadline = time.time() + 20\n"
+    "while extra and not os.path.exists(trigger) and time.time() < deadline:\n"
+    "    time.sleep(0.02)\n"
+    "if extra:\n"
+    "    handles.append(open(extra, 'rb'))\n"
+    "time.sleep(120)\n"
+)
+
+
+def hold_open(root: str, tag: str, paths: list[str], trigger: str = "", extra: str = "") -> subprocess.Popen:
+    """A child process that holds transcripts open, so the fd scan sees them.
+
+    It returns only once the files are known to be open, so a discovery can never
+    race the holder's own startup. A second transcript is opened once the trigger
+    appears, which is how a conversation switch is staged while a discovery is
+    already running.
+    """
+    ready = os.path.join(root, "holder-%s.ready" % tag)
+    process = subprocess.Popen(
+        [sys.executable, "-c", HOLDER_CODE, ready, trigger, extra, *paths],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 20
+    while not os.path.exists(ready) and process.poll() is None and time.time() < deadline:
+        time.sleep(0.02)
+    return process
+
+
+def stop_holder(process: subprocess.Popen) -> None:
+    process.kill()
+    process.wait(timeout=30)
+
+
+def await_ready(ready: str, pid: int) -> None:
+    """Wait for a forked child to signal it is set up, or for it to die."""
+    deadline = time.time() + 20
+    while not os.path.exists(ready) and time.time() < deadline:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if done == pid:
+            return
+        time.sleep(0.02)
+
+
+def stop_forked(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def tty_holder(root: str, tag: str) -> tuple[int, str, int, int]:
+    """A real process with its own controlling terminal and nothing open.
+
+    It stands in for a cold-resumed OMP: alive and foreground on a fresh pty,
+    but holding no transcript. Returns (pid, terminal id, master fd, time before
+    fork) — the master stays open so the OS cannot hand the same tty number to another
+    process mid-check. The terminal id is OMP's own: /dev/ stripped, slashes
+    hyphenated, exactly what names the breadcrumb file.
+    """
+    master, slave = pty.openpty()
+    slave_name = os.ttyname(slave)
+    ready = os.path.join(root, "tty-%s.ready" % tag)
+    before_fork_ns = time.time_ns()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(master)
+            os.login_tty(slave)
+            os.execv(sys.executable, [sys.executable, "-c", HOLDER_CODE, ready, "", ""])
+        finally:
+            os._exit(1)
+    os.close(slave)
+    await_ready(ready, pid)
+    terminal_id = slave_name[len("/dev/") :].replace("/", "-") if slave_name.startswith("/dev/") else slave_name
+    return pid, terminal_id, master, before_fork_ns
+
+
+def daemon_holder(root: str, tag: str) -> int:
+    """A live process with no controlling terminal: ps answers ?? for it, so
+    no terminal breadcrumb can ever belong to it."""
+    ready = os.path.join(root, "daemon-%s.ready" % tag)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setsid()
+            devnull = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull, 0)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            os.execv(sys.executable, [sys.executable, "-c", HOLDER_CODE, ready, "", ""])
+        finally:
+            os._exit(1)
+    await_ready(ready, pid)
+    return pid
+
+
+def stamp_breadcrumb(home: str, terminal_id: str, cwd: str, target: str) -> str:
+    """OMP's own terminal breadcrumb: cwd, then the session file, one per line."""
+    directory = os.path.join(home, ".omp", "agent", "terminal-sessions")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, terminal_id)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("%s\n%s\n" % (cwd, target))
+    return path
+
+
+def fake_tern(
+    directory: str, payloads: list[dict], switch_second: bool = False, sleep_second: str = "", second_script: str = ""
+) -> str:
+    """A `tern` stand-in that reports one foreground process per invocation.
+
+    Only the shape that matters is reproduced: the pane's foreground process
+    with its pid, name, argv and cwd. switch_second/sleep_second let the second
+    invocation — the stability re-check — declare that the process changed while
+    its transcript was being read, and second_script runs on that same
+    invocation, which is how a breadcrumb rewrite mid-resolution is staged.
+    """
+    state = os.path.join(directory, "state")
+    os.makedirs(state, exist_ok=True)
+    for index, payload in enumerate(payloads):
+        write_file(state, "payload-%d.json" % index, json.dumps(payload).encode("utf-8"))
+    if switch_second:
+        write_file(state, "switch-second", b"")
+    if sleep_second:
+        write_file(state, "sleep-second", sleep_second.encode("ascii"))
+    if second_script:
+        write_file(state, "second-script", second_script.encode("utf-8"))
+    script = os.path.join(directory, "bin", "tern")
+    os.makedirs(os.path.dirname(script), exist_ok=True)
+    last = len(payloads) - 1
+    with open(script, "w", encoding="utf-8") as handle:
+        handle.write(
+            "#!/bin/sh\n"
+            'state="%s"\n'
+            'calls=$(cat "$state/calls" 2>/dev/null || echo 0)\n'
+            'echo $((calls + 1)) > "$state/calls"\n'
+            'if [ "$calls" -ge %d ]; then calls=%d; fi\n'
+            'if [ "$calls" = "%d" ]; then\n'
+            '  [ -f "$state/switch-second" ] && : > "$state/switch"\n'
+            '  [ -f "$state/sleep-second" ] && sleep "$(cat "$state/sleep-second")"\n'
+            '  [ -f "$state/second-script" ] && sh "$state/second-script"\n'
+            "fi\n"
+            'cat "$state/payload-$calls.json"\n' % (state, last, last, last)
+        )
+    os.chmod(script, 0o755)
+    return os.path.join(directory, "bin")
+
+
+def discover_env(root: str, home: str, bin_dir: str) -> dict:
+    """A discovery run's env: its own state, a temp OMP store and a stand-in CLI."""
+    env = env_for(root)
+    env["HOME"] = home
+    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def omp_transcript(directory: str, stamp: str, sid: str, cwd: str, records: list[dict], parent: str = "") -> str:
+    """Write a session transcript: a title preamble, a session header, then records."""
+    os.makedirs(directory, exist_ok=True)
+    header = {"type": "session", "id": sid, "cwd": cwd, "title": "Chat " + sid[:4]}
+    if parent:
+        header["parentSession"] = parent
+    path = os.path.join(directory, "%s_%s.jsonl" % (stamp, sid))
+    with open(path, "w", encoding="utf-8") as handle:
+        for record in [{"type": "title", "title": header["title"]}, header, *records]:
+            handle.write(json.dumps(record) + "\n")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +612,472 @@ def case_backfill(root: str) -> None:
         len(hits) == 1 and hits[0]["name"] == "shot one.png",
         str(spaced_res),
     )
+
+
+def case_discover(root: str) -> None:
+    env = env_for(root)
+    home = os.path.join(root, "home")
+    store = os.path.join(home, ".omp", "agent", "sessions")
+    work = os.path.join(root, "work")
+    os.makedirs(work, exist_ok=True)
+
+    inline = make_png((51, 52, 53))
+    blob = make_png((61, 62, 63))
+    blob_digest = hashlib.sha256(blob).hexdigest()
+    blob_dir = os.path.join(root, "blobs", blob_digest[:2])
+    os.makedirs(blob_dir, exist_ok=True)
+    write_file(blob_dir, blob_digest, blob)
+    referenced = write_file(work, "shot one.png", make_png((71, 72, 73)))
+    relative = write_file(work, "rel.png", make_png((74, 75, 76)))
+    advisor_media = write_file(work, "advisor.png", make_png((81, 82, 83)))
+    child_media = write_file(work, "child.png", make_png((91, 92, 93)))
+    other_media = write_file(work, "other.png", make_png((101, 102, 103)))
+
+    def payload(process: subprocess.Popen, name: str = "18.8.7", argv: tuple = ("omp",)) -> dict:
+        # The live CLI reports the command's version in `name` and the command
+        # itself in argv, so both halves are exercised as the host reports them.
+        return {"foreground": {"pid": process.pid, "name": name, "argv": list(argv), "cwd": work}}
+
+    def discover(
+        pane: str,
+        payloads: list[dict],
+        tag: str,
+        second_switch: bool = False,
+        second_sleep: str = "",
+        **fields,
+    ):
+        bin_dir = fake_tern(
+            os.path.join(root, "bin-" + tag), payloads, switch_second=second_switch, sleep_second=second_sleep
+        )
+        request = {"op": "discover", "pane_id": pane, "host": socket.gethostname(), "cwd": work, "label": "Chat"}
+        request.update(fields)
+        return call(request, discover_env(root, home, bin_dir))
+
+    def message(text: str) -> dict:
+        return {"type": "message", "role": "user", "content": [{"type": "text", "text": text}]}
+
+    main = omp_transcript(
+        os.path.join(store, "conv-main"),
+        "2026-01-01T00-00-00-000Z",
+        SESSION_A,
+        work,
+        [
+            {"type": "message", "role": "user", "content": [
+                {"type": "image", "data": _b64(inline), "mimeType": "image/png"}]},
+            {"type": "message", "role": "user", "content": [
+                {"type": "image", "data": "blob:sha256:" + blob_digest, "mimeType": "image/png"}]},
+            message("rendered rel.png and opened `%s`" % referenced),
+        ],
+    )
+    # The advisor transcript sits inside the conversation's own stem directory
+    # and names no parent, so only the layout can exclude it.
+    advisor = write_file(
+        os.path.join(store, "conv-main", os.path.basename(main)[: -len(".jsonl")]),
+        "__advisor.jsonl",
+        (
+            json.dumps({"type": "session", "id": SESSION_C, "cwd": work, "title": "Advisor"})
+            + "\n"
+            + json.dumps({"type": "message", "role": "user", "content": [
+                {"type": "text", "text": "opened `%s`" % advisor_media}]})
+            + "\n"
+        ).encode("utf-8"),
+    )
+    child = omp_transcript(
+        os.path.join(store, "conv-child"),
+        "2026-01-02T00-00-00-000Z",
+        SESSION_B,
+        work,
+        [message("opened `%s`" % child_media)],
+        parent=main,
+    )
+
+    live = hold_open(root, "live", [main, advisor, child])
+    try:
+        code, res = discover(
+            "pane-live",
+            [payload(live)] * 2,
+            "live",
+            window_key="win-live",
+            tern_session_id="tern-live",
+            tern_session_name="Tern tern-live",
+        )
+        ok = check(
+            "discover answers with a session, its items and plain errors",
+            code == 0 and bool(res) and res.get("ok") is True and plain_errors(res.get("errors")),
+            str(res),
+        )
+        if ok:
+            bound = res.get("session") or {}
+            check(
+                "discover binds the pane to the transcript's own conversation",
+                bound.get("id") == SESSION_A
+                and bound.get("pane_id") == "pane-live"
+                and bound.get("window_key") == "win-live"
+                and bound.get("tern_session_id") == "tern-live"
+                and bound.get("cwd") == work
+                and bound.get("label") == "Chat",
+                str(bound),
+            )
+            digests = {item["sha256"] for item in res["items"]}
+            paths = {item["path"] for item in res["items"] if item["path"] is not None}
+            check(
+                "discover imports the conversation's inline and blob images",
+                {hashlib.sha256(inline).hexdigest(), blob_digest} <= digests,
+                str(sorted(digests)),
+            )
+            check(
+                "discover imports the files the conversation referenced, resolved in its cwd",
+                {os.path.realpath(referenced), os.path.realpath(relative)} <= paths,
+                str(sorted(paths)),
+            )
+            check(
+                "discover never imports the advisor or a child transcript",
+                not {os.path.realpath(advisor_media), os.path.realpath(child_media)} & paths,
+                str(sorted(paths)),
+            )
+            _, listed = call({"op": "list", "pane_id": "pane-live", "window_key": "win-live"}, env)
+            check(
+                "the pane's gallery shows the discovered media without a manual import",
+                bool(listed.get("session"))
+                and listed["session"]["id"] == SESSION_A
+                and listed["total"] == len(res["items"]),
+                str(listed.get("total")),
+            )
+            _, repeat = discover("pane-live", [payload(live)] * 2, "live", window_key="win-live")
+            _, after = call({"op": "list", "pane_id": "pane-live", "window_key": "win-live"}, env)
+            check(
+                "a repeated discover dedupes instead of importing again",
+                bool(repeat) and repeat.get("ok") is True and after["total"] == len(res["items"]),
+                "%s vs %s" % (after["total"], len(res["items"])),
+            )
+    finally:
+        stop_holder(live)
+
+    # A second live conversation in the same process, sharing the cwd, must
+    # never be chosen by recency: the choice is refused instead.
+    other = omp_transcript(
+        os.path.join(store, "conv-other"),
+        "2026-01-03T00-00-00-000Z",
+        SESSION_C,
+        work,
+        [message("opened `%s`" % other_media)],
+    )
+    ambiguous = hold_open(root, "amb", [main, other])
+    try:
+        code, res = discover("pane-amb", [payload(ambiguous)] * 2, "amb")
+        _, listed = call({"op": "list", "pane_id": "pane-amb"}, env)
+        check(
+            "two live conversations in one process never pick one",
+            code == 0
+            and bool(res)
+            and res.get("ok") is True
+            and res.get("session") is None
+            and res.get("items") == []
+            and bool(res.get("errors"))
+            and plain_errors(res.get("errors"))
+            and listed.get("session") is None,
+            str(res),
+        )
+    finally:
+        stop_holder(ambiguous)
+
+    # A pane running a shell instead of OMP fails closed, and the binding it
+    # already has survives the attempt untouched.
+    call(
+        {"op": "touch", "session": session(SESSION_B, "pane-shell", "win-shell", "tern-shell", "Beta", work)},
+        env,
+    )
+    shell = hold_open(root, "shell", [main])
+    try:
+        code, res = discover("pane-shell", [payload(shell, name="zsh", argv=("zsh",))] * 2, "shell")
+        _, listed = call({"op": "list", "pane_id": "pane-shell"}, env)
+        check(
+            "a pane whose foreground is not OMP fails closed and keeps its binding",
+            code == 0
+            and bool(res)
+            and res.get("session") is None
+            and res.get("items") == []
+            and bool(res.get("errors"))
+            and plain_errors(res.get("errors"))
+            and bool(listed.get("session"))
+            and listed["session"]["id"] == SESSION_B,
+            str(res),
+        )
+    finally:
+        stop_holder(shell)
+
+    # A transcript outside this host's OMP session store is never imported, even
+    # with a valid header: discovery resolves conversations, never paths.
+    outside = omp_transcript(
+        os.path.join(root, "elsewhere"),
+        "2026-01-04T00-00-00-000Z",
+        SESSION_A,
+        work,
+        [message("opened `%s`" % relative)],
+    )
+    stray = hold_open(root, "stray", [outside])
+    try:
+        code, res = discover("pane-stray", [payload(stray)] * 2, "stray")
+        check(
+            "a transcript outside the OMP session store is never imported",
+            code == 0
+            and bool(res)
+            and res.get("session") is None
+            and res.get("items") == []
+            and bool(res.get("errors"))
+            and plain_errors(res.get("errors")),
+            str(res),
+        )
+    finally:
+        stop_holder(stray)
+
+    # The conversation switching mid-read must import nothing and bind nothing.
+    switched = hold_open(
+        root, "switch", [other], trigger=os.path.join(root, "bin-switch", "state", "switch"), extra=main
+    )
+    try:
+        code, res = discover(
+            "pane-switch", [payload(switched)] * 2, "switch", second_switch=True, second_sleep="0.5"
+        )
+        _, listed = call({"op": "list", "pane_id": "pane-switch"}, env)
+        check(
+            "a conversation switch during discovery imports and binds nothing",
+            code == 0
+            and bool(res)
+            and res.get("session") is None
+            and res.get("items") == []
+            and bool(res.get("errors"))
+            and plain_errors(res.get("errors"))
+            and listed.get("session") is None,
+            str(res),
+        )
+    finally:
+        stop_holder(switched)
+
+    code, res = call({"op": "discover"}, env)
+    check(
+        "discover without a pane fails closed",
+        code == 0
+        and bool(res)
+        and res.get("ok") is True
+        and res.get("session") is None
+        and res.get("items") == []
+        and bool(res.get("errors"))
+        and plain_errors(res.get("errors")),
+        str(res),
+    )
+
+    empty_bin = os.path.join(root, "empty-bin")
+    os.makedirs(empty_bin, exist_ok=True)
+    bare = env_for(root)
+    bare["HOME"] = home
+    bare["PATH"] = empty_bin
+    code, res = call({"op": "discover", "pane_id": "pane-live", "host": socket.gethostname()}, bare)
+    _, listed = call({"op": "list", "pane_id": "pane-live"}, env)
+    check(
+        "discover without the Tern CLI fails closed and leaves the binding alone",
+        code == 0
+        and bool(res)
+        and res.get("session") is None
+        and res.get("items") == []
+        and bool(res.get("errors"))
+        and bool(listed.get("session"))
+        and listed["session"]["id"] == SESSION_A,
+        str(res),
+    )
+
+
+def case_discover_cold(root: str) -> None:
+    """A cold-resumed conversation holds no transcript open; the terminal's own
+    breadcrumb is the only live proof of which conversation the pane is in."""
+    env = env_for(root)
+    home = os.path.join(root, "home")
+    store = os.path.join(home, ".omp", "agent", "sessions")
+    work = os.path.join(root, "work")
+    os.makedirs(work, exist_ok=True)
+
+    def message(text: str) -> dict:
+        return {"type": "message", "role": "user", "content": [{"type": "text", "text": text}]}
+
+    def payload(pid: int) -> dict:
+        return {"foreground": {"pid": pid, "name": "18.8.7", "argv": ["omp"], "cwd": work}}
+
+    def discover(pane: str, payloads: list[dict], tag: str, second_script: str = "", **fields):
+        bin_dir = fake_tern(os.path.join(root, "bin-" + tag), payloads, second_script=second_script)
+        request = {"op": "discover", "pane_id": pane, "host": socket.gethostname(), "cwd": work, "label": "Chat"}
+        request.update(fields)
+        return call(request, discover_env(root, home, bin_dir))
+
+    def failed(res: dict | None, code: int) -> bool:
+        return (
+            code == 0
+            and bool(res)
+            and res.get("ok") is True
+            and res.get("session") is None
+            and res.get("items") == []
+            and bool(res.get("errors"))
+            and plain_errors(res.get("errors"))
+        )
+
+    first_media = write_file(work, "cold one.png", make_png((111, 112, 113)))
+    second_media = write_file(work, "cold two.png", make_png((114, 115, 116)))
+    cold = omp_transcript(
+        os.path.join(store, "conv-cold"),
+        "2026-01-05T00-00-00-000Z",
+        SESSION_A,
+        work,
+        [message("kept `%s` and `%s`" % (first_media, second_media))],
+    )
+    other_media = write_file(work, "other.png", make_png((117, 118, 119)))
+    other = omp_transcript(
+        os.path.join(store, "conv-other"),
+        "2026-01-06T00-00-00-000Z",
+        SESSION_C,
+        work,
+        [message("opened `%s`" % other_media)],
+    )
+
+    pid, terminal_id, master, before_fork_ns = tty_holder(root, "cold")
+    try:
+        crumb = stamp_breadcrumb(home, terminal_id, work, cold)
+        code, res = discover("pane-cold", [payload(pid)] * 2, "cold", window_key="win-cold")
+        ok = check(
+            "a cold-resumed conversation is found through its terminal breadcrumb",
+            code == 0
+            and bool(res)
+            and res.get("ok") is True
+            and bool(res.get("session"))
+            and res["session"]["id"] == SESSION_A
+            and plain_errors(res.get("errors")),
+            str(res),
+        )
+        if ok:
+            paths = {item["path"] for item in res["items"] if item["path"] is not None}
+            check(
+                "the cold conversation's own images appear without a manual import",
+                {os.path.realpath(first_media), os.path.realpath(second_media)} <= paths
+                and os.path.realpath(other_media) not in paths,
+                str(sorted(paths)),
+            )
+            _, listed = call({"op": "list", "pane_id": "pane-cold", "window_key": "win-cold"}, env)
+            check(
+                "the pane binds and lists the cold conversation's media",
+                bool(listed.get("session"))
+                and listed["session"]["id"] == SESSION_A
+                and listed["total"] == len(res["items"]),
+                str(listed.get("total")),
+            )
+
+        # A stamp older than the process belongs to the terminal's previous
+        # occupant: discovery refuses it and the pane keeps its binding.
+        call(
+            {"op": "touch", "session": session(SESSION_B, "pane-stale", "win-stale", "tern-stale", "Beta", work)},
+            env,
+        )
+        crumb = stamp_breadcrumb(home, terminal_id, work, cold)
+        old = time.time_ns() - 3600 * 1_000_000_000
+        os.utime(crumb, ns=(old, old))
+        code, res = discover("pane-stale", [payload(pid)] * 2, "stale")
+        _, listed = call({"op": "list", "pane_id": "pane-stale"}, env)
+        check(
+            "a breadcrumb older than the process is a prior occupant's and binds nothing",
+            failed(res, code)
+            and bool(listed.get("session"))
+            and listed["session"]["id"] == SESSION_B,
+            str(res),
+        )
+
+        # Nanosecond stamps from immediately before fork must also be refused.
+        # Whole-second boot telemetry used to mistake these for current stamps.
+        stamp_breadcrumb(home, terminal_id, work, cold)
+        os.utime(crumb, ns=(before_fork_ns, before_fork_ns))
+        code, res = discover("pane-subsecond-stale", [payload(pid)] * 2, "subsecond-stale")
+        _, listed = call({"op": "list", "pane_id": "pane-subsecond-stale"}, env)
+        check(
+            "a breadcrumb predating fork at subsecond precision imports and binds nothing",
+            failed(res, code) and listed.get("session") is None and listed.get("items") == [],
+            str(res),
+        )
+
+        explicit_resume = payload(pid)
+        explicit_resume["foreground"]["argv"].append("--resume=" + cold)
+        code, res = discover("pane-explicit-resume", [explicit_resume] * 2, "explicit-resume")
+        check(
+            "an unchanged older breadcrumb agrees with the live process's exact resume path",
+            code == 0 and bool(res.get("session")) and res["session"]["id"] == SESSION_A
+            and {item["path"] for item in res["items"]} == {os.path.realpath(first_media), os.path.realpath(second_media)},
+            str(res),
+        )
+        wrong_resume = payload(pid)
+        wrong_resume["foreground"]["argv"].extend(["--resume", other])
+        code, res = discover("pane-wrong-resume", [wrong_resume] * 2, "wrong-resume")
+        check(
+            "a prior breadcrumb cannot override a different explicit resume path",
+            failed(res, code),
+            str(res),
+        )
+
+        # A breadcrumb rewritten mid-resolution — the conversation switching
+        # while discovery reads — must import nothing and bind nothing.
+        stamp_breadcrumb(home, terminal_id, work, cold)
+        rewrite = "printf '%%s\\n%%s\\n' '%s' '%s' > '%s'" % (work, other, crumb)
+        code, res = discover("pane-race", [payload(pid)] * 2, "race", second_script=rewrite)
+        _, listed = call({"op": "list", "pane_id": "pane-race"}, env)
+        check(
+            "a breadcrumb switched mid-resolution imports and binds nothing",
+            failed(res, code) and listed.get("session") is None,
+            str(res),
+        )
+
+        # A target outside this host's session store is refused no matter what
+        # the terminal claims.
+        outside = omp_transcript(
+            os.path.join(root, "elsewhere"),
+            "2026-01-07T00-00-00-000Z",
+            SESSION_A,
+            work,
+            [message("opened `%s`" % first_media)],
+        )
+        stamp_breadcrumb(home, terminal_id, work, outside)
+        code, res = discover("pane-outside", [payload(pid)] * 2, "outside")
+        check(
+            "a breadcrumb pointing outside the session store binds nothing",
+            failed(res, code),
+            str(res),
+        )
+
+        # A child transcript names its parent and is never the pane's own
+        # conversation, even when the breadcrumb points straight at it.
+        child = omp_transcript(
+            os.path.join(store, "conv-child"),
+            "2026-01-08T00-00-00-000Z",
+            SESSION_B,
+            work,
+            [message("opened `%s`" % first_media)],
+            parent=cold,
+        )
+        stamp_breadcrumb(home, terminal_id, work, child)
+        code, res = discover("pane-child", [payload(pid)] * 2, "crumbchild")
+        check(
+            "a breadcrumb pointing at a child transcript binds nothing",
+            failed(res, code),
+            str(res),
+        )
+    finally:
+        stop_forked(pid)
+        os.close(master)
+
+    # A foreground OMP with no controlling terminal has no breadcrumb to trust.
+    daemon = daemon_holder(root, "notty")
+    try:
+        code, res = discover("pane-notty", [payload(daemon)] * 2, "notty")
+        check(
+            "a process with no controlling terminal binds nothing",
+            failed(res, code),
+            str(res),
+        )
+    finally:
+        stop_forked(daemon)
 
 
 def case_touch_identity(root: str) -> None:
@@ -820,6 +1477,8 @@ def main() -> int:
         ("input rejection", case_rejections),
         ("blob references", case_blob_references),
         ("transcript backfill", case_backfill),
+        ("discover live conversation", case_discover),
+        ("discover cold-resumed conversation", case_discover_cold),
         ("binding order", case_binding_order),
         ("legacy migration", case_legacy_migration),
         ("shared initialization", case_shared_initialization),
@@ -832,7 +1491,7 @@ def main() -> int:
             case(root)
     finally:
         for root in TEMP_DIRS:
-            shutil.rmtree(root, ignore_errors=True)
+            print("Self-check fixture retained: %s" % root)
     print("\n%d checks, %d failed" % (CHECKS, len(FAILURES)))
     for label in FAILURES:
         print("  failed: %s" % label)

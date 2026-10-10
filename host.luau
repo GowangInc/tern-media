@@ -172,7 +172,7 @@ local function prepareImages(s, cx)
     end
 end
 
-refresh = function(s, cx)
+refresh = function(s, cx, discover)
     s.generation += 1
     local generation = s.generation
     s.loading = true
@@ -216,7 +216,12 @@ refresh = function(s, cx)
     -- Resolve the current pane before any touch; viewing never fabricates a terminal
     -- conversation and a missing workspace never widens to all media.
     if s.pin or not s.owner.pane_id or s.owner.pane_id == "" then listing(); return end
-    request(ownerQuery(s), function(response, err)
+    local q = ownerQuery(s)
+    if discover then
+        q = table.clone(s.owner)
+        q.op = "discover"
+    end
+    request(q, function(response, err)
         if generation ~= s.generation then return end
         if not response then failure(err); return end
         local resolved = response.session
@@ -333,7 +338,7 @@ local function action(s, act, value, cx)
     if act == "refresh" then
         for key, image in s.images do if image.error then s.images[key] = nil end end
         s.operationErrors, s.notice = nil, nil
-        refresh(s, cx)
+        refresh(s, cx, true)
     elseif act == "scope" and table.find(scopes, value) then s.scope, s.offset = value, 0; refresh(s, cx)
     elseif act == "kind" and table.find(kinds, value) then s.kind, s.offset = value, 0; refresh(s, cx)
     elseif act == "previous" and s.offset > 0 then s.offset = math.max(0, s.offset - PAGE); refresh(s, cx)
@@ -441,7 +446,7 @@ tern.block.define("gallery", {
             items = {}, sessions = {}, watches = {}, total = 0, generation = 0, loading = true,
             images = {}, imageQueue = {}, imageJobs = 0, archiveOffset = 0, archives = false,
         }
-        tern.timer(0, function() prepareImages(s, cx); refresh(s, cx) end)
+        tern.timer(0, function() prepareImages(s, cx); refresh(s, cx, true) end)
         return s
     end,
     title = function(s) return s.pin and "Media · " .. s.pin.label or "Session Media" end,
@@ -454,13 +459,14 @@ tern.block.define("gallery", {
         if ev.act == "context" then
             local owner = context(ev)
             local changed = owner.pane_id ~= s.owner.pane_id or owner.window_key ~= s.owner.window_key or owner.tern_session_id ~= s.owner.tern_session_id
+            local discover = changed or owner.label ~= s.owner.label
             s.owner = owner
             if not s.pin then
                 if changed then
                     s.offset, s.selected, s.items, s.total, s.session, s.bound = 0, nil, {}, 0, nil, nil
                     s.compare, s.comparing, s.edit = {}, false, nil
                 end
-                refresh(s, cx)
+                refresh(s, cx, discover)
             end
         else action(s, ev.act, ev.value, cx) end
     end,
@@ -506,7 +512,15 @@ tern.block.define("gallery", {
             return item ~= nil
         end
         local shortcuts = {r = "refresh", a = "compare-a", b = "compare-b", c = "compare", t = "tags", i = "import", w = "watch", o = "open", ["/"] = "search", ["["] = "previous", ["]"] = "next", p = s.pin and "follow" or "pin", h = "archives"}
-        if name == "escape" or name == "esc" then s.comparing, s.archives = false, false; return true end
+        if name == "escape" or name == "esc" then
+            if s.comparing or s.archives then
+                s.comparing, s.archives = false, false
+            else
+                cx:save()
+                cx:exit(0)
+            end
+            return true
+        end
         if name == "s" then action(s, "scope", scopes[(table.find(scopes, s.scope) or 1) % #scopes + 1], cx); return true end
         if name == "k" then action(s, "kind", kinds[(table.find(kinds, s.kind) or 1) % #kinds + 1], cx); return true end
         local act = shortcuts[name]

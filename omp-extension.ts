@@ -28,13 +28,20 @@
  * never move the pane's binding. Binding writes go through one queue and
  * commit in the order their events arrived, however slow the backend is.
  *
+ * A conversation's existing media is imported as it starts, switches or
+ * branches, from the exact transcript OMP reports for that context: an explicit
+ * command stays available, but a resumed conversation no longer needs one. A
+ * transcript already read at its current size and mtime is not read again, and
+ * one that does not exist yet is left for a later event.
+ *
  * Self-check: `bun omp-extension.ts` (or `... --self-check`) exercises the media
- * extraction, the workspace identity and the binding write queue, and exits
- * non-zero when a check fails.
+ * extraction, the workspace identity, the binding write queue, and the
+ * automatic historical import against a real backend in a temporary store, and
+ * exits non-zero when a check fails.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir, hostname, tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -582,6 +589,7 @@ async function runBackend(dir: string, request: string, timeoutMs: number): Prom
 	try {
 		const child = Bun.spawn([PYTHON_BIN, join(dir, BACKEND_FILE)], {
 			cwd: dir,
+			env: process.env,
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -788,6 +796,101 @@ function passivePayload(ref: SessionRef, workspace: TernWorkspace | undefined = 
 }
 
 // ============================================================================
+// Historical import: media an existing transcript already carried
+// ============================================================================
+
+/**
+ * A transcript version this process already imported: the file, plus the size
+ * and mtime of the bytes it read. A later event imports again only when one of
+ * them changed, so a start/switch/branch run reads each version at most once.
+ */
+interface ImportedTranscript {
+	file: string;
+	size: number;
+	mtimeMs: number;
+}
+
+/** What each conversation imported so far. Nothing is recorded before an import succeeds. */
+const importedTranscripts = new Map<string, ImportedTranscript>();
+
+/** Identity of a materialized transcript; undefined while the file does not exist yet. */
+function transcriptFingerprint(file: string | undefined): ImportedTranscript | undefined {
+	if (file === undefined || file.length === 0) return undefined;
+	try {
+		const info = statSync(file);
+		if (!info.isFile()) return undefined;
+		return { file, size: info.size, mtimeMs: info.mtimeMs };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Import the media one existing transcript already carried, into the
+ * conversation that owns it. `file` is the exact transcript its session
+ * reported: no other file, and no other conversation, is ever read.
+ *
+ * Automatic (start/switch/branch): only a main session may import — a child
+ * session's media belongs to the parent conversation through the capture path,
+ * and re-reading a parent transcript from a child context would be wrong. A
+ * transcript that is not materialized yet stays unrecorded, so a later event
+ * imports it once it exists, and a version already imported (same file, size
+ * and mtime) is not read again. Reports retain counts and failure reasons but
+ * never reference paths or transcript contents.
+ *
+ * Explicit (/media-backfill): always reads the named file and reports what the
+ * backend answered, including a transcript that carried no media at all.
+ *
+ * Returns whether the backend was asked and answered `ok`. A failed request is
+ * reported and never recorded, so the next event retries it.
+ */
+async function backfillTranscript(
+	ctx: HandlerCtx,
+	ref: SessionRef,
+	file: string | undefined,
+	imported: Map<string, ImportedTranscript>,
+	automatic: boolean,
+): Promise<boolean> {
+	if (automatic && !ref.isMain) return false;
+	if (file === undefined || file.length === 0) return false;
+	const fingerprint = automatic ? transcriptFingerprint(file) : undefined;
+	if (automatic) {
+		if (fingerprint === undefined) return false;
+		// The same transcript, byte for byte, already landed in the gallery.
+		const previous = imported.get(ref.id);
+		const unchanged =
+			previous !== undefined &&
+			previous.file === fingerprint.file &&
+			previous.size === fingerprint.size &&
+			previous.mtimeMs === fingerprint.mtimeMs;
+		if (unchanged) return false;
+	}
+	// An import files media under the conversation; it must land after the
+	// binding writes that came before it, and never name the pane itself.
+	await bindings.settled();
+	const result = await callBackend(
+		"backfill",
+		{ session: passivePayload(ref), transcript_path: file },
+		BACKFILL_TIMEOUT_MS,
+	);
+	if (!result.ok) {
+		report(ctx, `Tern media: historical import failed: ${result.error}`, "warning", "Tern media: historical import request failed");
+		return false;
+	}
+	const stored = result.data.items.length;
+	const unresolved = result.data.errors.length;
+	if (fingerprint !== undefined && unresolved === 0) imported.set(ref.id, fingerprint);
+	if (automatic && stored === 0 && unresolved === 0) return true;
+	if (stored === 0 && unresolved === 0) {
+		report(ctx, "Tern media: historical import found no media in that transcript", "info");
+		return true;
+	}
+	const summary = backfillSummary(stored, unresolved, result.data.errors);
+	report(ctx, summary.message, unresolved > 0 ? "warning" : "info", summary.log);
+	return true;
+}
+
+// ============================================================================
 // Extension
 // ============================================================================
 
@@ -828,41 +931,22 @@ export default function ternMedia(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Bind this pane to the conversation that owns it. Only a main session may
-	 * bind; a child session's items are filed under the parent conversation
-	 * without touching the binding. Every bind goes through one queue, so rapid
-	 * start/switch/branch events commit in the order they arrived.
+	 * Bind this pane to the conversation that owns it, then import the media
+	 * that conversation's existing transcript already carried. Only a main
+	 * session does either: a child session's items are filed under the parent
+	 * conversation by capture, without touching the binding or re-reading the
+	 * parent's transcript. Every bind goes through one queue, so rapid
+	 * start/switch/branch events commit in the order they arrived; the import
+	 * waits for that write and stays off the queue, so a slow transcript never
+	 * holds up the next event's binding.
 	 */
-	const bind = (ctx: HandlerCtx): Promise<void> => {
+	const bindAndImport = async (ctx: HandlerCtx): Promise<void> => {
 		const ref = sessionRef(ctx);
-		if (ref === undefined || !ref.isMain) return Promise.resolve();
-		return bindings.enqueue(() => touch(ctx, ref, true));
+		if (ref === undefined || !ref.isMain) return;
+		const file = sessionFile(ctx);
+		await bindings.enqueue(() => touch(ctx, ref, true));
+		await backfillTranscript(ctx, ref, file, importedTranscripts, true);
 	};
-
-	const backfill = async (ctx: HandlerCtx, ref: SessionRef, file: string): Promise<void> => {
-		// An import files media under the conversation; it must land after the
-		// binding writes that came before it, and never name the pane itself.
-		await bindings.settled();
-		const result = await callBackend(
-			"backfill",
-			{ session: passivePayload(ref), transcript_path: file },
-			BACKFILL_TIMEOUT_MS,
-		);
-		if (!result.ok) {
-			report(ctx, `Tern media: historical import failed: ${result.error}`, "warning", "Tern media: historical import request failed");
-			return;
-		}
-		const stored = result.data.items.length;
-		const unresolved = result.data.errors.length;
-		if (stored === 0 && unresolved === 0) {
-			report(ctx, "Tern media: historical import found no media in that transcript", "info");
-			return;
-		}
-		const summary = backfillSummary(stored, unresolved, result.data.errors);
-		report(ctx, summary.message, unresolved > 0 ? "warning" : "info", summary.log);
-	};
-
-
 
 	/**
 	 * Keep only items whose file exists, resolved against the session's cwd.
@@ -1017,7 +1101,7 @@ export default function ternMedia(pi: ExtensionAPI): void {
 			report(ctx, `Tern media: no such transcript: ${file}`, "warning", "Tern media: transcript path not found");
 			return;
 		}
-		await backfill(ctx, ref, file);
+		await backfillTranscript(ctx, ref, file, importedTranscripts, false);
 	};
 
 	const usage = [
@@ -1078,13 +1162,13 @@ export default function ternMedia(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		await bind(ctx);
+		await bindAndImport(ctx);
 	});
 	pi.on("session_switch", async (_event, ctx) => {
-		await bind(ctx);
+		await bindAndImport(ctx);
 	});
 	pi.on("session_branch", async (_event, ctx) => {
-		await bind(ctx);
+		await bindAndImport(ctx);
 	});
 	// Re-touch only when the label actually changed (auto-titles settle late).
 	pi.on("agent_end", async (_event, ctx) => {
@@ -1276,6 +1360,45 @@ export function selfCheck(): Check[] {
 	return checks;
 }
 
+function storedImageMatches(item: unknown, bytes: Buffer): boolean {
+	if (item === null || typeof item !== "object" || !("kind" in item) || !("stored_path" in item)) return false;
+	if (item.kind !== "image" || typeof item.stored_path !== "string") return false;
+	try {
+		return readFileSync(item.stored_path).equals(bytes);
+	} catch {
+		return false;
+	}
+}
+
+/** What the store lists for one conversation, or the reason the request failed. */
+async function listedItems(sessionId: string): Promise<{ items: unknown[]; failure?: string }> {
+	const result = await callBackend("list", { session_id: sessionId }, LOOKUP_TIMEOUT_MS);
+	return result.ok ? { items: result.data.items } : { items: [], failure: result.error };
+}
+
+/** A context for the checks: reports into `notices` and reads one transcript file. */
+function checkContext(cwd: string, transcript: string, notices: string[]): HandlerCtx {
+	return {
+		cwd,
+		sessionManager: {
+			getSessionId: () => "self-check-conversation",
+			getSessionFile: () => transcript,
+			getSessionName: () => "Self check",
+			getHeader: () => undefined,
+		},
+		ui: {
+			notify: (message): void => {
+				notices.push(message);
+			},
+		},
+		setTimeout: (callback, ms, ...args) => setTimeout(callback, ms, ...args),
+		// The checks schedule nothing: a handle only ever needs clearing if one was set.
+		clearTimer: (timer): void => {
+			clearTimeout(timer as number);
+		},
+	};
+}
+
 /**
  * Checks that need the event loop: a binding write must commit in the order its
  * event arrived even when an earlier write is the slowest one.
@@ -1307,6 +1430,114 @@ async function asyncChecks(): Promise<Check[]> {
 		ok: ran.join(",") === "after failure",
 		detail: ran.join(","),
 	});
+
+	// The media an existing conversation already carried, as the automatic import
+	// on session start/switch/branch sees it: it must reach that conversation's
+	// gallery without a manual import, once per transcript version, and never
+	// through a child session.
+	const workDir = mkdtempSync(join(tmpdir(), "tern-media-self-check-"));
+	const transcript = join(workDir, "conversation.jsonl");
+	const previousStateDir = process.env.TERN_MEDIA_STATE_DIR;
+	const previousPluginDir = process.env.TERN_MEDIA_PLUGIN_DIR;
+	// Bun defines `dir` on import.meta; the standard library type does not.
+	const moduleDir = (import.meta as ImportMeta & { dir?: string }).dir;
+	process.env.TERN_MEDIA_STATE_DIR = join(workDir, "state");
+	if (
+		previousPluginDir === undefined &&
+		typeof moduleDir === "string" &&
+		existsSync(join(moduleDir, BACKEND_FILE))
+	) {
+		process.env.TERN_MEDIA_PLUGIN_DIR = moduleDir;
+	}
+	const imported = new Map<string, ImportedTranscript>();
+	const notices: string[] = [];
+	const conversation: SessionRef = { id: "self-check-conversation", label: "Self check", cwd: workDir, isMain: true };
+	const ctx = checkContext(workDir, transcript, notices);
+	const firstBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR42mOo0OCCIwbiOAAbYwqhtjVsrQAAAABJRU5ErkJggg==", "base64");
+	const nextBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR42mPg0qiAIwbiOAANowqhMSMGYAAAAABJRU5ErkJggg==", "base64");
+	const imageLine = `${JSON.stringify({
+		type: "message",
+		role: "user",
+		content: [
+			{
+				type: "image",
+				data: firstBytes.toString("base64"),
+				mimeType: "image/png",
+			},
+		],
+	})}\n`;
+	try {
+		// A first creation has no transcript yet: nothing to import, nothing to
+		// warn about, and the conversation stays eligible for a later event.
+		const beforeFile = await backfillTranscript(ctx, conversation, undefined, imported, true);
+		const missingFile = await backfillTranscript(ctx, conversation, transcript, imported, true);
+		checks.push({
+			name: "a conversation with no transcript yet imports nothing, silently, and stays eligible",
+			ok: beforeFile === false && missingFile === false && notices.length === 0,
+			detail: notices.join(" | "),
+		});
+
+		writeFileSync(transcript, imageLine);
+		const resumed = await backfillTranscript(ctx, conversation, transcript, imported, true);
+		const first = await listedItems(conversation.id);
+		checks.push({
+			name: "a resumed conversation's existing image reaches its gallery",
+			ok: resumed === true && first.items.length === 1 && storedImageMatches(first.items[0], firstBytes),
+			detail: first.failure ?? `${first.items.length} item(s)`,
+		});
+
+		const repeat = await backfillTranscript(ctx, conversation, transcript, imported, true);
+		const repeated = await listedItems(conversation.id);
+		checks.push({
+			name: "an unchanged transcript is not imported again on the next event",
+			ok: repeat === false && repeated.items.length === 1 && storedImageMatches(repeated.items[0], firstBytes),
+		});
+
+		appendFileSync(transcript, imageLine.replace(firstBytes.toString("base64"), nextBytes.toString("base64")));
+		const grown = await backfillTranscript(ctx, conversation, transcript, imported, true);
+		const growth = await listedItems(conversation.id);
+		checks.push({
+			name: "a transcript that grew becomes eligible again and its newer media lands",
+			ok: grown === true && growth.items.length === 2 &&
+				growth.items.some((item) => storedImageMatches(item, firstBytes)) &&
+				growth.items.some((item) => storedImageMatches(item, nextBytes)),
+			detail: growth.failure ?? `${growth.items.length} item(s)`,
+		});
+
+		const child = await backfillTranscript(ctx, { ...conversation, isMain: false }, transcript, new Map(), true);
+		const afterChild = await listedItems(conversation.id);
+		checks.push({
+			name: "a child session never imports into its parent conversation's gallery",
+			ok: child === false && afterChild.items.length === 2,
+			detail: afterChild.failure ?? `${afterChild.items.length} item(s)`,
+		});
+
+		const lateTranscript = join(workDir, "late-media.jsonl");
+		const latePath = join(workDir, "late.png");
+		const lateConversation = { ...conversation, id: "self-check-late-media" };
+		writeFileSync(lateTranscript, imageLine + JSON.stringify({
+			type: "message", role: "user", content: [{ type: "text", text: `Opened \`${latePath}\`` }],
+		}) + "\n");
+		await backfillTranscript(ctx, lateConversation, lateTranscript, imported, true);
+		const beforeLateFile = await listedItems(lateConversation.id);
+		writeFileSync(latePath, nextBytes);
+		await backfillTranscript(ctx, lateConversation, lateTranscript, imported, true);
+		const afterLateFile = await listedItems(lateConversation.id);
+		checks.push({
+			name: "media arriving after a partial import reaches the unchanged conversation without duplicates",
+			ok: beforeLateFile.items.length === 1 && storedImageMatches(beforeLateFile.items[0], firstBytes) &&
+				afterLateFile.items.length === 2 &&
+				afterLateFile.items.some((item) => storedImageMatches(item, firstBytes)) &&
+				afterLateFile.items.some((item) => storedImageMatches(item, nextBytes)),
+			detail: afterLateFile.failure ?? `${afterLateFile.items.length} retained items`,
+		});
+	} finally {
+		if (previousStateDir === undefined) delete process.env.TERN_MEDIA_STATE_DIR;
+		else process.env.TERN_MEDIA_STATE_DIR = previousStateDir;
+		if (previousPluginDir === undefined) delete process.env.TERN_MEDIA_PLUGIN_DIR;
+		else process.env.TERN_MEDIA_PLUGIN_DIR = previousPluginDir;
+		console.log(`Self-check fixture retained: ${workDir}`);
+	}
 	return checks;
 }
 

@@ -2,9 +2,16 @@
 """Tern Session Media backend.
 
 One JSON request on stdin, one JSON response on stdout. Ops: touch, register,
-list, tag, watch, backfill. Python standard library only; retained originals are
-immutable and content addressed, so a rewritten screenshot keeps its older
-version instead of replacing it.
+list, tag, watch, backfill, discover. Python standard library only; retained
+originals are immutable and content addressed, so a rewritten screenshot keeps
+its older version instead of replacing it.
+
+`discover` resolves the pane's own live conversation from this host's process
+table and imports the transcript that process holds open, so media an open
+conversation already carries appears without a manual import. A resumed
+conversation idling between turns holds no transcript open; it is resolved
+through the terminal breadcrumb OMP stamps on every create/switch/resume,
+proven against the live process's own controlling tty and birth time.
 
 State lives outside the plugin: TERN_MEDIA_STATE_DIR, else
 ~/Library/Application Support/Tern/media (macOS), else
@@ -23,9 +30,11 @@ import re
 import shutil
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 
 MAX_ITEM_BYTES = 64 * 1024 * 1024
@@ -46,6 +55,20 @@ MAX_LIMIT = 40
 MAX_SCAN_FILES = 200
 MAX_BACKFILL_IMAGES = 200
 MAX_BACKFILL_PATHS = 200
+# Discovery reads a live process table and its open-file table through bounded
+# host-local tools, and never reads more of a transcript than its header, so a
+# hung or enormous process can neither stall nor exhaust this backend.
+MAX_DISCOVER_FILES = 64
+MAX_DISCOVER_HEADER_LINES = 64
+MAX_DISCOVER_HEADER_BYTES = 256 * 1024
+MAX_DISCOVER_OUTPUT = 1024 * 1024
+# Exclude mapped binaries and directory descriptors, not arbitrary high fd numbers.
+DISCOVER_FD_RANGE = "^txt,^mem,^cwd,^rtd"
+LSOF_TIMEOUT_S = 4
+PS_TIMEOUT_S = 4
+# A terminal breadcrumb is two short lines — the cwd and the session file —
+# plus an optional marker, written by OMP itself; anything larger is not one.
+MAX_BREADCRUMB_BYTES = 16 * 1024
 PREVIEW_PX = 512
 SQLITE_TIMEOUT_S = 30.0
 # Bumped only when the schema changes. Stored in PRAGMA user_version so a
@@ -132,6 +155,18 @@ PREFERRED_EXT = {
 BLOB_REF_RE = re.compile(r"^blob:sha256:([0-9a-f]{64})$")
 BLOB_EXTENSIONS = tuple(EXT_MIME)
 OMP_BLOB_DIR = os.path.join(os.path.expanduser("~"), ".omp", "agent", "blobs")
+# A conversation's transcript is a session file in the agent directory beside
+# the blobs, named <timestamp>_<session id>.jsonl. Only files under that store
+# are ever considered a conversation, so a stray JSONL elsewhere on the machine
+# can never be imported into a pane.
+OMP_SESSIONS_DIR = os.path.join(os.path.dirname(OMP_BLOB_DIR), "sessions")
+# OMP's terminal breadcrumbs, one file per terminal, stamped synchronously on
+# every session create/switch/resume. A resumed-but-idle OMP holds no
+# transcript open, so this pointer is the only live proof of its conversation.
+OMP_TERMINAL_SESSIONS_DIR = os.path.join(os.path.dirname(OMP_BLOB_DIR), "terminal-sessions")
+# The foreground command the Tern CLI reports for OMP. Some builds report a
+# version string in `name` instead of the command, so argv is checked too.
+OMP_PROCESS_NAMES = ("omp", "omp-custom")
 
 _MEDIA_EXT_ALT = "|".join(sorted(EXT_MIME, key=len, reverse=True))
 # Markdown targets may contain spaces (often wrapped in <>), and quoted or
@@ -143,6 +178,9 @@ MEDIA_REF_RE = re.compile(
 )
 MARKDOWN_TITLE_RE = re.compile(r"""\s+("[^"]*"|'[^']*')$""")
 SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
+# A terminal id becomes a breadcrumb filename, so anything that could leave
+# the breadcrumb directory — or name a hidden file — is not a terminal.
+TERMINAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def now_iso() -> str:
@@ -1171,6 +1209,460 @@ def op_backfill(conn: sqlite3.Connection, root: str, req: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# discover
+# ---------------------------------------------------------------------------
+
+
+def run_text(argv: list[str], timeout: int) -> str | None:
+    """Bounded stdout of a host-local command, or None when it cannot answer."""
+    try:
+        done = subprocess.run(
+            argv, capture_output=True, text=True, errors="replace", timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    output = done.stdout or ""
+    if len(output) > MAX_DISCOVER_OUTPUT:
+        return None
+    return output
+
+
+def foreground_process(pane_id: str, window_key: str = "") -> dict | None:
+    """The pane's foreground process, as the local Tern CLI reports it."""
+    cli = shutil.which("tern")
+    if not cli:
+        return None
+    argv = [cli, "process", pane_id, "--json"]
+    if window_key:
+        argv.extend(["--window", window_key])
+    output = run_text(argv, TOOL_TIMEOUT_S)
+    if not output:
+        return None
+    try:
+        payload = json.loads(output)
+    except ValueError:
+        return None
+    foreground = payload.get("foreground") if isinstance(payload, dict) else None
+    if not isinstance(foreground, dict):
+        return None
+    pid = foreground.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    return foreground
+
+
+def is_omp_process(foreground: dict) -> bool:
+    """Whether a reported foreground process is OMP itself, never a shell under it."""
+    if clean(foreground.get("name")).lower() in OMP_PROCESS_NAMES:
+        return True
+    argv = foreground.get("argv")
+    if not isinstance(argv, list):
+        return False
+    return bool(argv) and os.path.basename(clean(argv[0])).lower() in OMP_PROCESS_NAMES
+
+
+def open_transcript_paths(pid: int) -> list[str] | None:
+    """The transcript files one process holds open, or None when it cannot be read.
+
+    A conversation is only ever identified by what its own process has open, so
+    no name, timestamp or directory listing can substitute for a live session.
+    """
+    fd_dir = "/proc/%d/fd" % pid
+    paths: list[str] = []
+    if os.path.isdir(fd_dir):
+        try:
+            entries = os.listdir(fd_dir)
+        except OSError:
+            return None
+        for entry in entries:
+            try:
+                paths.append(os.readlink(os.path.join(fd_dir, entry)))
+            except OSError:
+                continue
+    else:
+        lsof = shutil.which("lsof")
+        if not lsof:
+            return None
+        # -a ANDs the pid and descriptor selectors, so another process's files
+        # can never enter the answer; -b avoids macOS stat stalls.
+        output = run_text(
+            [lsof, "-nP", "-b", "-a", "-p", str(pid), "-d", DISCOVER_FD_RANGE, "-Fn"], LSOF_TIMEOUT_S
+        )
+        if output is None:
+            return None
+        paths = [line[1:] for line in output.splitlines() if line.startswith("n/")]
+    found: list[str] = []
+    for path in paths:
+        if not path.endswith(".jsonl"):
+            continue
+        # An advisor or other internal transcript keeps a __-prefixed name and
+        # is never the conversation the pane is working in.
+        if os.path.basename(path).startswith("__"):
+            continue
+        if len(found) >= MAX_DISCOVER_FILES:
+            return None
+        if path not in found:
+            found.append(path)
+    return sorted(found)
+
+
+def darwin_process_birth_ns(pid: int) -> int | None:
+    """One process's p_starttime as epoch nanoseconds, via sysctl(3).
+
+    p_starttime heads kinfo_proc — the p_un union is extern_proc's first
+    member — so the timeval is the reply's first bytes: 64-bit tv_sec, then
+    32-bit tv_usec, a layout that has held on every 64-bit macOS. Values that
+    cannot be a birth time answer None, so a drifted layout fails closed
+    instead of trusting a breadcrumb.
+    """
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL("/usr/lib/libc.dylib")
+        # CTL_KERN, KERN_PROC, KERN_PROC_PID, pid
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(ctypes.byref(mib), 4, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        if not 16 <= size.value <= MAX_BREADCRUMB_BYTES:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(ctypes.byref(mib), 4, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+        if size.value < 16:
+            return None
+        seconds, micros = struct.unpack_from("<qi", buffer.raw[:16])
+    except (OSError, ValueError):
+        return None
+    now = int(datetime.now(timezone.utc).timestamp())
+    if not 0 < seconds <= now or not 0 <= micros < 1_000_000:
+        return None
+    return seconds * 1_000_000_000 + micros * 1_000
+
+
+def process_birth_ns(pid: int) -> int | None:
+    """An upper bound on process birth in epoch nanoseconds, or None.
+
+    Breadcrumbs must postdate the current process, not its prior tty occupant.
+    Round up by the kernel clock's resolution rather than accepting a stamp
+    from earlier in the same microsecond/tick. Linux's whole-second btime is
+    too coarse; sample realtime after BOOTTIME for a conservative epoch offset.
+    Unknown sub-second telemetry never proves ownership.
+    """
+    if sys.platform == "darwin":
+        birth = darwin_process_birth_ns(pid)
+        return None if birth is None else birth + 1_000
+    if not os.path.isfile("/proc/self/stat") or not hasattr(time, "CLOCK_BOOTTIME"):
+        return None
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as handle:
+            data = handle.read(MAX_BREADCRUMB_BYTES + 1)
+        if len(data) > MAX_BREADCRUMB_BYTES:
+            return None
+        close = data.rfind(b")")
+        if close < 0:
+            return None
+        # comm (field 2) may hold spaces and parentheses, so fields are counted
+        # from the final ')': field 3 is fields[0], starttime (22) fields[19].
+        fields = data[close + 1 :].split()
+        ticks = int(fields[19])
+        hertz = os.sysconf("SC_CLK_TCK")
+        boot_ns = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        epoch_offset = time.time_ns() - boot_ns
+    except (OSError, ValueError, IndexError):
+        return None
+    if hertz <= 0 or ticks < 0:
+        return None
+    return epoch_offset + ((ticks + 1) * 1_000_000_000 + hertz - 1) // hertz
+
+
+def controlling_terminal_id(pid: int) -> str | None:
+    """The terminal id OMP derives for the process's controlling tty, or None.
+
+    ps reports the controlling terminal (ttys024, pts/3); OMP's terminal id
+    strips any /dev/ prefix and hyphens the remaining slashes, so ttys024 and
+    pts-3 are the breadcrumb filenames. No controlling terminal — ps answers
+    ?? — or a name that could not be a plain file means no breadcrumb can
+    ever be keyed to this process.
+    """
+    ps = shutil.which("ps")
+    if not ps:
+        return None
+    output = run_text([ps, "-p", str(pid), "-o", "tty="], PS_TIMEOUT_S)
+    if output is None:
+        return None
+    lines = output.strip().splitlines()
+    if len(lines) != 1:
+        return None
+    tty = lines[0].strip()
+    if tty.startswith("/dev/"):
+        tty = tty[len("/dev/"):]
+    terminal_id = tty.replace("/", "-")
+    if not TERMINAL_ID_RE.match(terminal_id):
+        return None
+    return terminal_id
+
+
+def terminal_breadcrumb(terminal_id: str, birth_ns: int, resumed_path: str = "") -> tuple[tuple, str, dict] | None:
+    """One terminal's breadcrumb: (fingerprint, transcript path, header).
+
+    The file is a verified bounded regular file. A stamp older than this process
+    is refused unless its target is also the exact absolute --resume path in
+    that process's argv: some OMP builds retain an unchanged resume breadcrumb.
+    Sub-second birth bounds otherwise exclude prior tty occupants. The target is a main
+    transcript in its encoded-cwd directory directly under this host's OMP
+    session store: anything missing, empty, a child, an advisor nested one
+    level deeper, or outside the store is refused. The fingerprint lets the
+    stability re-check prove the file was not rewritten mid-read.
+    """
+    path = os.path.join(OMP_TERMINAL_SESSIONS_DIR, terminal_id)
+    try:
+        fd, _ = open_regular_file(path, MAX_BREADCRUMB_BYTES)
+        try:
+            info = os.fstat(fd)
+            if info.st_mtime_ns < birth_ns and not resumed_path:
+                return None
+            content = b""
+            while len(content) <= MAX_BREADCRUMB_BYTES:
+                chunk = os.read(fd, min(65536, MAX_BREADCRUMB_BYTES + 1 - len(content)))
+                if not chunk:
+                    break
+                content += chunk
+            if len(content) > MAX_BREADCRUMB_BYTES:
+                return None
+            fingerprint = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        finally:
+            os.close(fd)
+    except (ValueError, OSError):
+        return None
+    try:
+        lines = content.decode("utf-8").strip().split("\n")
+    except ValueError:
+        return None
+    if len(lines) < 2:
+        return None
+    target = lines[1]
+    if not os.path.isabs(target) or not target.endswith(".jsonl"):
+        return None
+    if os.path.basename(target).startswith("__"):
+        return None
+    resolved = os.path.realpath(target)
+    if info.st_mtime_ns < birth_ns and resolved != resumed_path:
+        return None
+    if not local_session_store(resolved):
+        return None
+    relative = os.path.relpath(resolved, os.path.realpath(OMP_SESSIONS_DIR))
+    if len(relative.split(os.sep)) != 2:
+        return None
+    header = session_header(resolved)
+    if header is None:
+        return None
+    return fingerprint, resolved, header
+
+
+def names_parent(value) -> bool:
+    """Whether a session record declares a parent session (a child transcript)."""
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value not in (None, "")
+
+
+def session_header(path: str) -> dict | None:
+    """The conversation header of one transcript, or None if it is not a main session.
+
+    Only the bounded header prefix is read: the conversation's title and its
+    later message content never enter this process.
+    """
+    try:
+        fd, _ = open_regular_file(path, MAX_TRANSCRIPT_BYTES)
+    except (ValueError, OSError):
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        total = 0
+        for _ in range(MAX_DISCOVER_HEADER_LINES):
+            line = handle.readline(MAX_TRANSCRIPT_LINE_BYTES + 1)
+            if not line:
+                break
+            total += len(line)
+            if total > MAX_DISCOVER_HEADER_BYTES or len(line) > MAX_TRANSCRIPT_LINE_BYTES:
+                break
+            try:
+                record = json.loads(line.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+            if not isinstance(record, dict) or record.get("type") != "session":
+                continue
+            identifier = clean(record.get("id"))
+            if not identifier:
+                return None
+            # A session that names a parent is a child: its media belong to the
+            # conversation that owns the pane, never to the pane itself.
+            if names_parent(record.get("parentSession")):
+                return None
+            return {
+                "id": identifier,
+                "cwd": clean(record.get("cwd")),
+                "title": clean(record.get("title")),
+            }
+    return None
+
+
+def local_session_store(path: str) -> bool:
+    """Whether a transcript lives in this host's own OMP session store."""
+    root = os.path.realpath(OMP_SESSIONS_DIR)
+    return path.startswith(root + os.sep) and os.path.isfile(path)
+
+
+def cold_resumed_conversation(
+    pane_id: str, window_key: str, foreground: dict, open_paths: list[str]
+) -> tuple[dict, dict, str] | None:
+    """The conversation of a live OMP that holds no transcript open.
+
+    Idle OMP closes its transcript between turns. Its terminal breadcrumb must
+    postdate this process, or agree with an explicit absolute resume argument.
+    The process, argv, controlling terminal and breadcrumb fingerprint are
+    checked twice; a changed or ambiguous conversation never binds the pane.
+    """
+    pid = foreground["pid"]
+    birth_ns = process_birth_ns(pid)
+    if birth_ns is None:
+        return None
+    terminal_id = controlling_terminal_id(pid)
+    if terminal_id is None:
+        return None
+    argv = foreground.get("argv", [])
+    argv = argv if isinstance(argv, list) else []
+    if "--" in argv:
+        argv = argv[: argv.index("--")]
+    resumes = []
+    for index, arg in enumerate(argv):
+        if not isinstance(arg, str):
+            continue
+        if arg.startswith("--resume="):
+            value = arg.split("=", 1)[1]
+        elif arg in ("--resume", "-r"):
+            value = argv[index + 1] if index + 1 < len(argv) else ""
+        else:
+            continue
+        resumes.append(os.path.realpath(value) if isinstance(value, str) and os.path.isabs(value) else "")
+    resumed_path = resumes[0] if len(resumes) == 1 else ""
+    first = terminal_breadcrumb(terminal_id, birth_ns, resumed_path)
+    if first is None:
+        return None
+
+    again = foreground_process(pane_id, window_key)
+    if again is None or again.get("pid") != pid or not is_omp_process(again):
+        return None
+    if again.get("argv") != foreground.get("argv"):
+        return None
+    if open_transcript_paths(pid) != open_paths:
+        return None
+    if controlling_terminal_id(pid) != terminal_id:
+        return None
+    second = terminal_breadcrumb(terminal_id, birth_ns, resumed_path)
+    if second is None or second != first:
+        return None
+    _, transcript, header = second
+    return foreground, header, transcript
+
+
+def active_conversation(pane_id: str, window_key: str = "") -> tuple[dict, dict, str] | None:
+    """The pane's own live conversation: (foreground, header, transcript path).
+
+    The process is identified before and after its transcript is read, and the
+    transcript set must be identical both times: a discovery that ran into a
+    session switch can never bind the pane to the conversation that left. A
+    live OMP holding no transcript open — a resumed conversation idling
+    between turns — is resolved through its terminal's own breadcrumb instead.
+    """
+    foreground = foreground_process(pane_id, window_key)
+    if foreground is None or not is_omp_process(foreground):
+        return None
+    pid = foreground["pid"]
+    paths = open_transcript_paths(pid)
+    if paths is None:
+        return None
+    found: list[tuple[str, dict]] = []
+    for path in paths:
+        resolved = os.path.realpath(path)
+        if not local_session_store(resolved):
+            continue
+        header = session_header(resolved)
+        if header is not None:
+            found.append((resolved, header))
+    # OMP keeps an advisor transcript — and its other internal transcripts —
+    # inside the active conversation's own stem directory. Such a file is never
+    # the pane's conversation, whatever its header declares, so anything nested
+    # under another candidate's stem is dropped. The advisor's header names no
+    # parent, which is why the layout, not the header, is what excludes it.
+    stems = [path[: -len(".jsonl")] for path, _ in found]
+    candidates = [
+        entry for entry in found if not any(entry[0].startswith(stem + os.sep) for stem in stems)
+    ]
+    if len(candidates) > 1:
+        # Two open main transcripts are an ambiguity nothing — not even the
+        # terminal's own breadcrumb — is allowed to resolve.
+        return None
+    if not candidates:
+        return cold_resumed_conversation(pane_id, window_key, foreground, paths)
+    transcript, header = candidates[0]
+
+    again = foreground_process(pane_id, window_key)
+    if again is None or again.get("pid") != pid or not is_omp_process(again):
+        return None
+    if open_transcript_paths(pid) != paths:
+        return None
+    if session_header(transcript) != header:
+        return None
+    return foreground, header, transcript
+
+
+def op_discover(conn: sqlite3.Connection, root: str, req: dict) -> dict:
+    """Import the media of the pane's own live conversation, then bind the pane.
+
+    Everything is resolved from this host only: the pane's foreground process as
+    the local Tern CLI reports it, and the transcript that process holds open in
+    the local OMP session store. Nothing the caller sends is ever used as a
+    path, so no other host's store and no unrelated conversation is reachable.
+    """
+    pane_id = clean(req.get("pane_id"))
+    errors: list[dict] = []
+    if not pane_id:
+        errors.append({"name": "discover", "error": "discover requires the pane it belongs to"})
+        return {"ok": True, "session": None, "items": [], "errors": errors}
+    active = active_conversation(pane_id, clean(req.get("window_key")))
+    if active is None:
+        errors.append({"name": "discover", "error": "no live conversation is open in this pane"})
+        return {"ok": True, "session": None, "items": [], "errors": errors}
+    foreground, header, transcript = active
+
+    # The conversation id is the OMP session id, exactly as the extension's own
+    # binding names it, so imports land in the row the pane already works in.
+    # Naming the pane is the binding, and it happens only now that the process
+    # and its transcript have been confirmed twice.
+    descriptor = {
+        "id": header["id"],
+        "cwd": header["cwd"] or clean(foreground.get("cwd")) or clean(req.get("cwd")),
+        "label": clean(req.get("label")) or header["title"],
+        "host": clean(req.get("host")),
+        "pane_id": pane_id,
+        "window_key": clean(req.get("window_key")),
+        "tern_session_id": clean(req.get("tern_session_id")),
+        "tern_session_name": clean(req.get("tern_session_name")),
+    }
+    result = op_backfill(conn, root, {"session": descriptor, "transcript_path": transcript})
+    errors.extend(result["errors"])
+    return {
+        "ok": True,
+        "session": find_session(conn, header["id"]),
+        "items": result["items"],
+        "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 
@@ -1194,6 +1686,8 @@ def dispatch(req: dict) -> dict:
             return op_watch(conn, req)
         if op == "backfill":
             return op_backfill(conn, root, req)
+        if op == "discover":
+            return op_discover(conn, root, req)
         raise ValueError("unknown op: %s" % (op or "(missing)"))
     finally:
         conn.close()
