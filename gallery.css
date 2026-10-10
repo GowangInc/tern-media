@@ -1,0 +1,120 @@
+/* Native TSP gallery: inherit Tern's palette and type; media remains the field. */
+.sf-main[data-surface="plugin.media.gallery"] .media-gallery {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px;
+    color: inherit;
+    background: transparent;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-toolbar,
+.sf-main[data-surface="plugin.media.gallery"] .media-detail,
+.sf-main[data-surface="plugin.media.gallery"] .media-archives,
+.sf-main[data-surface="plugin.media.gallery"] .media-watches {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid currentColor;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-control {
+    min-height: 28px;
+    padding: 4px 8px;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    border-radius: 2px;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-control:focus {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-active {
+    font-weight: 700;
+    border-bottom: 2px solid currentColor;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-control:disabled {
+    opacity: 0.5;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-kinds {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-preview,
+.sf-main[data-surface="plugin.media.gallery"] .media-compare {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 0;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-slot {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    max-width: 100%;
+    gap: 6px;
+    padding: 8px;
+    border: 1px solid currentColor;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-ledger {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-left: 10px;
+    border-left: 1px solid currentColor;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 8px 10px;
+    border-bottom: 1px solid currentColor;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-selected {
+    border-left: 3px solid currentColor;
+    padding-left: 5px;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-editor,
+.sf-main[data-surface="plugin.media.gallery"] .media-status {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px;
+    border: 1px solid currentColor;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-error {
+    border-left-width: 3px;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-preview img,
+.sf-main[data-surface="plugin.media.gallery"] .media-slot img,
+.sf-main[data-surface="plugin.media.gallery"] .media-preview .sf-image,
+.sf-main[data-surface="plugin.media.gallery"] .media-slot .sf-image {
+    width: 100%;
+    max-width: 100%;
+    max-height: 480px;
+    object-fit: contain;
+}
+
+.sf-main[data-surface="plugin.media.gallery"] .media-card img,
+.sf-main[data-surface="plugin.media.gallery"] .media-card .sf-image {
+    max-width: 100%;
+    max-height: 180px;
+    object-fit: contain;
+}

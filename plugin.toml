@@ -1,0 +1,12 @@
+schema = 1
+id = "media"
+name = "Session Media"
+version = "0.1.0"
+description = "Session-scoped media timeline, retained screenshots, tags and comparison"
+host = "host.luau"
+window = "window.luau"
+styles = ["gallery.css"]
+
+[[blocks]]
+id = "gallery"
+title = "Session Media"
