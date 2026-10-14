@@ -13,6 +13,14 @@ conversation idling between turns holds no transcript open; it is resolved
 through OMP's terminal breadcrumb, verified against the live process's tty
 and birth time, or its exact absolute resume argument for an older pointer.
 
+A pane and a Tern session each reach this backend in one of Tern's two id
+spaces: the native window reports their block id, the CLI and TERN_PANE report
+that block id with the daemon instance's tag. Discovery asks the CLI with the
+id it reports itself, and a binding resolves through the ids the CLI's own
+index proves are one pane — the caller's id and its block-id alias when that
+alias is that one pane's alone. Two open panes that share a block id are never
+merged, and an ambiguous or absent id binds nothing rather than guess.
+
 State lives outside the plugin: TERN_MEDIA_STATE_DIR, else
 ~/Library/Application Support/Tern/media (macOS), else
 $XDG_STATE_HOME/tern-media. Directories are 0700 and files 0600.
@@ -71,6 +79,16 @@ PS_TIMEOUT_S = 4
 MAX_BREADCRUMB_BYTES = 16 * 1024
 PREVIEW_PX = 512
 SQLITE_TIMEOUT_S = 30.0
+# Tern numbers one pane in two id spaces. Its window APIs (cx.session:panes,
+# cx.session:focused, and every host/pane list they feed) report the pane's own
+# block id, while the CLI and a pane's TERN_PANE report the same block id plus
+# the daemon instance's tag in the high bits: 112562502893575 against
+# 7009386627079 for the same live pane, with every one of a window's panes
+# differing by a whole multiple of 2**44. A binding therefore matches a pane
+# when the two ids agree on the block id, which is exactly how a window
+# addresses its panes, and nothing else.
+PANE_ID_BLOCK_BITS = 44
+PANE_ID_BLOCK_SPAN = 1 << PANE_ID_BLOCK_BITS
 # Bumped only when the schema changes. Stored in PRAGMA user_version so a
 # schema-current database is opened without a single write statement.
 SCHEMA_VERSION = 1
@@ -595,24 +613,69 @@ def find_session(conn: sqlite3.Connection, session_id: str) -> dict | None:
     return session_row(row)
 
 
-def binding_for_pane(conn: sqlite3.Connection, pane_id: str, window_key: str) -> dict | None:
-    pane_id = clean(pane_id)
-    if not pane_id:
+def block_id(value: str) -> int | None:
+    """The block id a Tern id names in either id space, or None if it names none."""
+    value = clean(value)
+    if not value.isascii() or not value.isdigit() or len(value) > 20:
         return None
+    return int(value) % PANE_ID_BLOCK_SPAN
+
+
+def id_aliases(value: str, known: list[int]) -> tuple[list[str], bool]:
+    """The ids one pane or Tern session may be recorded under, and any ambiguity.
+
+    A window names a pane or session by its block id; the daemon names the same
+    one with the instance tag its id's high bits carry. Which ids are the same
+    then comes from the CLI's own index and never from arithmetic: an id the CLI
+    reports is exact, an id it does not report is the block id of exactly one
+    entry, and a block id several entries share is ambiguous — it stays that
+    literal id, is never widened onto the others, and a caller that must prove
+    an owner refuses it.
+    """
+    value = clean(value)
+    block = block_id(value)
+    if block is None or not known:
+        return [value], False
+    wanted = int(value)
+    matches = [entry for entry in known if entry % PANE_ID_BLOCK_SPAN == block]
+    if wanted in known:
+        # A daemon id is its own identity. Its untagged alias is this one's only
+        # when no other entry shares the block id.
+        if len(matches) == 1 and block != wanted:
+            return [value, str(block)], False
+        return [value], False
+    # Only an untagged window id may acquire a daemon tag. A closed daemon id
+    # must not adopt a different daemon's pane or session with the same low bits.
+    if wanted >= PANE_ID_BLOCK_SPAN:
+        return [value], False
+    if len(matches) == 1:
+        return [value, str(matches[0])], False
+    return [value], len(matches) > 1
+
+
+def binding_for_panes(conn: sqlite3.Connection, pane_ids: list[str], window_key: str) -> dict | None:
+    """The most recently bound session among one pane's own ids, or None.
+
+    Every id passed in names that same pane, so the newest binding among them is
+    the pane's own — the ordering a single-id lookup always used.
+    """
+    ids = [pane_id for pane_id in (clean(value) for value in pane_ids) if pane_id]
+    if not ids:
+        return None
+    placeholders = ",".join("?" * len(ids))
+    order = "ORDER BY COALESCE(NULLIF(bound_at, ''), touched_at) DESC, rowid DESC LIMIT 1"
     window_key = clean(window_key)
     if window_key:
         row = conn.execute(
-            "SELECT * FROM sessions WHERE pane_id = ? AND window_key = ? "
-            "ORDER BY COALESCE(NULLIF(bound_at, ''), touched_at) DESC, rowid DESC LIMIT 1",
-            (pane_id, window_key),
+            "SELECT * FROM sessions WHERE pane_id IN (%s) AND window_key = ? %s" % (placeholders, order),
+            (*ids, window_key),
         ).fetchone()
         if row is not None:
             return session_row(row)
     # A blank window key must not widen the query beyond the pane.
     row = conn.execute(
-        "SELECT * FROM sessions WHERE pane_id = ? "
-        "ORDER BY COALESCE(NULLIF(bound_at, ''), touched_at) DESC, rowid DESC LIMIT 1",
-        (pane_id,),
+        "SELECT * FROM sessions WHERE pane_id IN (%s) %s" % (placeholders, order),
+        ids,
     ).fetchone()
     return session_row(row)
 
@@ -924,16 +987,44 @@ def scan_watch_root(conn: sqlite3.Connection, root: str, session: dict, director
     return errors
 
 
+def pane_request_ids(pane_id: str, window_key: str) -> tuple[list[str], bool]:
+    """The ids one pane request may be recorded under, and whether it is ambiguous.
+
+    An ambiguous block id proves no owner, so it names no id at all; a caller
+    naming a pane some other way keeps its exact id and costs no CLI call.
+    """
+    pane_id = clean(pane_id)
+    if not pane_id:
+        return [], False
+    if block_id(pane_id) is None:
+        return [pane_id], False
+    index = cli_index(window_key)
+    ids, ambiguous = id_aliases(pane_id, index[0] if index else [])
+    if ambiguous:
+        return [], True
+    return ids, False
+
+
 def op_list(conn: sqlite3.Connection, root: str, req: dict) -> dict:
     session_id = clean(req.get("session_id"))
     pane_id = clean(req.get("pane_id"))
     window_key = clean(req.get("window_key"))
-    binding = find_session(conn, session_id) or binding_for_pane(conn, pane_id, window_key)
+    pane_ids, ambiguous = pane_request_ids(pane_id, window_key)
+    binding = find_session(conn, session_id) or binding_for_panes(conn, pane_ids, window_key)
     scope = clean(req.get("scope")) or "conversation"
     if scope not in ("conversation", "workspace", "all"):
         scope = "conversation"
 
     errors: list[dict] = []
+    if ambiguous:
+        # Two open panes share this block id, so which conversation this pane
+        # owns is unproven: show none rather than choose one of them.
+        errors.append(
+            {
+                "name": "pane",
+                "error": "pane %s names more than one open pane; no conversation is shown for it" % pane_id,
+            }
+        )
     watch_roots: list[str] = []
     if binding is not None:
         watch_roots = [
@@ -956,9 +1047,17 @@ def op_list(conn: sqlite3.Connection, root: str, req: dict) -> dict:
     elif scope == "workspace":
         tern_id = clean(req.get("tern_session_id")) or (binding["tern_session_id"] if binding else "")
         if tern_id:
+            # One Tern session is recorded under the window's id or the daemon's.
+            # An id two open sessions share widens onto neither: it stays its
+            # own literal id, so distinct tagged sessions never merge.
+            index = cli_index(window_key)
+            tern_ids, _ambiguous = id_aliases(tern_id, index[1] if index else [])
             target_ids = [
                 row["id"]
-                for row in conn.execute("SELECT id FROM sessions WHERE tern_session_id = ?", (tern_id,))
+                for row in conn.execute(
+                    "SELECT id FROM sessions WHERE tern_session_id IN (%s)" % ",".join("?" * len(tern_ids)),
+                    tern_ids,
+                )
             ]
         if not target_ids:
             return {
@@ -1229,11 +1328,159 @@ def run_text(argv: list[str], timeout: int) -> str | None:
     return output
 
 
-def foreground_process(pane_id: str, window_key: str = "") -> dict | None:
-    """The pane's foreground process, as the local Tern CLI reports it."""
-    cli = shutil.which("tern")
-    if not cli:
+# The plugin runs in Tern's own process, whose PATH is the login environment the
+# app inherited and often carries no `tern`. Tern links the CLI into the first
+# of these directories that the user's shell searches and Tern can write to, so
+# a host whose PATH lacks it is asked there instead.
+TERN_CLI_DIRS = ("~/.local/bin", "~/bin", "/usr/local/bin", "/opt/homebrew/bin")
+
+
+def tern_cli() -> str | None:
+    """The Tern CLI's path, or None when this host has none."""
+    found = shutil.which("tern")
+    if found:
+        return found
+    for directory in TERN_CLI_DIRS:
+        path = os.path.join(os.path.expanduser(directory), "tern")
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+# One backend invocation serves one request, so the CLI's index is read at most
+# once per window and never outlives the request that needed it.
+_CLI_INDEX: dict[str, tuple[list[int], list[int]] | None] = {}
+
+
+def _cli_ids(payload: object) -> tuple[list[int], list[int]] | None:
+    """One `tern ls --json` answer as (pane ids, Tern session ids), or None.
+
+    A session row carries its own id and its tabs' blocks; a row that carries no
+    tabs is one parked pane and contributes its own id.
+    """
+    if not isinstance(payload, dict):
         return None
+    panes: list[int] = []
+    sessions: list[int] = []
+
+    def collect(into: list[int], value: object) -> None:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            into.append(value)
+
+    for key in ("sessions", "detached"):
+        for row in payload.get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            tabs = row.get("tabs")
+            if isinstance(tabs, list):
+                collect(sessions, row.get("id"))
+                for tab in tabs:
+                    for block in (tab.get("blocks") or []) if isinstance(tab, dict) else []:
+                        collect(panes, block.get("id") if isinstance(block, dict) else None)
+            else:
+                collect(panes, row.get("id"))
+    return panes, sessions
+
+
+def cli_index(window_key: str = "") -> tuple[list[int], list[int]] | None:
+    """The pane and Tern session ids the local Tern CLI reports, or None.
+
+    `tern ls --json` is the CLI's own index: the only authority on which pane
+    and session ids exist, and so on which window id and daemon id are one
+    identity. One backend invocation serves one request, so it is read at most
+    once per window.
+    """
+    if window_key not in _CLI_INDEX:
+        cli = tern_cli()
+        found: tuple[list[int], list[int]] | None = None
+        if cli:
+            argv = [cli, "ls", "--json"]
+            if window_key:
+                argv.extend(["--window", window_key])
+            output = run_text(argv, TOOL_TIMEOUT_S)
+            if output:
+                try:
+                    found = _cli_ids(json.loads(output))
+                except ValueError:
+                    found = None
+        _CLI_INDEX[window_key] = found
+    return _CLI_INDEX[window_key]
+
+
+def daemon_pane_id(pane_id: str, window_key: str = "") -> str | None:
+    """The id the Tern CLI and TERN_PANE use for the pane a caller named.
+
+    A window reports a pane's block id and the daemon reports that block id with
+    its instance tag, so the CLI's own pane index decides: the caller's id is
+    taken as it stands when the CLI reports it, else it must name exactly one
+    pane of that index. An id that names none, or more than one, resolves to
+    None, so discovery can never bind a guessed pane.
+    """
+    named = clean(pane_id)
+    block = block_id(named)
+    if block is None:
+        return None
+    index = cli_index(window_key)
+    if index is None or not index[0]:
+        return None
+    panes = index[0]
+    if int(named) in panes:
+        return named
+    if int(named) >= PANE_ID_BLOCK_SPAN:
+        return None
+    matches = [pane for pane in panes if pane % PANE_ID_BLOCK_SPAN == block]
+    if len(matches) != 1:
+        return None
+    return str(matches[0])
+
+
+def op_window(req: dict) -> dict:
+    """Use exact CLI identities for Tern's native layout and event targets."""
+    action = clean(req.get("action"))
+    if action not in ("resolve", "float", "dock", "move"):
+        raise ValueError("unknown gallery window action")
+    window_key = clean(req.get("window_key"))
+    cli = tern_cli()
+    pane = daemon_pane_id(clean(req.get("pane_id")), window_key)
+    if cli and not pane and action == "resolve":
+        index = cli_index(window_key)
+        block = block_id(clean(req.get("pane_id")))
+        if index is not None and block is not None and not any(
+            candidate % PANE_ID_BLOCK_SPAN == block for candidate in index[0]
+        ):
+            return {"ok": True, "pane_id": None}
+    if not cli or not pane:
+        raise ValueError("gallery pane is no longer uniquely identifiable")
+    if action == "resolve":
+        return {"ok": True, "pane_id": pane}
+    owner = daemon_pane_id(clean(req.get("owner_id")), window_key)
+    if action in ("float", "move") and (not owner or owner == pane):
+        raise ValueError("gallery owner is no longer uniquely identifiable")
+    focused = daemon_pane_id(clean(req.get("focused_id")), window_key)
+    if action == "float":
+        argv = [cli, "pip", pane, "--over", owner, "--corner", "tr", "--json"]
+    elif action == "move":
+        argv = [cli, "move", pane, "right-of", owner, "--json"]
+    else:
+        argv = [cli, "dock", pane, "right", "--json"]
+    if window_key:
+        argv.extend(["--window", window_key])
+    if run_text(argv, TOOL_TIMEOUT_S) is None:
+        raise ValueError("native gallery %s failed" % action)
+    # CLI docking/moving reveals its result; retain the plugin's focus=False
+    # contract, without overriding a different pane the user focused meanwhile.
+    if action in ("dock", "move") and focused and focused != pane:
+        scope = ["--window", window_key] if window_key else []
+        output = run_text([cli, "process", "@focused", "--json", *scope], TOOL_TIMEOUT_S)
+        current = json.loads(output) if output else {}
+        if str(current.get("pane")) == pane:
+            if run_text([cli, "focus", focused, "--json", *scope], TOOL_TIMEOUT_S) is None:
+                raise ValueError("gallery focus restoration failed")
+    return {"ok": True, "pane_id": pane}
+
+
+def cli_foreground(cli: str, pane_id: str, window_key: str) -> dict | None:
+    """One `tern process` answer for one pane id, or None when it has none."""
     argv = [cli, "process", pane_id, "--json"]
     if window_key:
         argv.extend(["--window", window_key])
@@ -1251,6 +1498,26 @@ def foreground_process(pane_id: str, window_key: str = "") -> dict | None:
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
     return foreground
+
+
+def foreground_process(pane_id: str, window_key: str = "") -> dict | None:
+    """The pane's foreground process, as the local Tern CLI reports it.
+
+    The caller's own id is asked for first, so a daemon id costs no extra call.
+    A window's pane id is not one the CLI knows, so the pane the CLI reports for
+    it is asked for instead; the answer itself is unchanged either way.
+    """
+    cli = tern_cli()
+    if not cli:
+        return None
+    named = clean(pane_id)
+    foreground = cli_foreground(cli, named, window_key)
+    if foreground is not None:
+        return foreground
+    resolved = daemon_pane_id(named, window_key)
+    if resolved is None or resolved == named:
+        return None
+    return cli_foreground(cli, resolved, window_key)
 
 
 def is_omp_process(foreground: dict) -> bool:
@@ -1647,7 +1914,9 @@ def op_discover(conn: sqlite3.Connection, root: str, req: dict) -> dict:
         "cwd": header["cwd"] or clean(foreground.get("cwd")) or clean(req.get("cwd")),
         "label": clean(req.get("label")) or header["title"],
         "host": clean(req.get("host")),
-        "pane_id": pane_id,
+        # The binding records the id the CLI and TERN_PANE use, so a pane that a
+        # window discovered and a pane the extension captured are one identity.
+        "pane_id": daemon_pane_id(pane_id, clean(req.get("window_key"))) or pane_id,
         "window_key": clean(req.get("window_key")),
         "tern_session_id": clean(req.get("tern_session_id")),
         "tern_session_name": clean(req.get("tern_session_name")),
@@ -1668,6 +1937,8 @@ def op_discover(conn: sqlite3.Connection, root: str, req: dict) -> dict:
 
 
 def dispatch(req: dict) -> dict:
+    if clean(req.get("op")) == "window":
+        return op_window(req)
     root = state_dir()
     conn = connect(root)
     try:

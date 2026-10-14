@@ -258,7 +258,13 @@ def stamp_breadcrumb(home: str, terminal_id: str, cwd: str, target: str) -> str:
 
 
 def fake_tern(
-    directory: str, payloads: list[dict], switch_second: bool = False, sleep_second: str = "", second_script: str = ""
+    directory: str,
+    payloads: list[dict],
+    switch_second: bool = False,
+    sleep_second: str = "",
+    second_script: str = "",
+    pane_ids: list[str] | None = None,
+    session_ids: list[str] | None = None,
 ) -> str:
     """A `tern` stand-in that reports one foreground process per invocation.
 
@@ -267,6 +273,11 @@ def fake_tern(
     invocation — the stability re-check — declare that the process changed while
     its transcript was being read, and second_script runs on that same
     invocation, which is how a breadcrumb rewrite mid-resolution is staged.
+
+    pane_ids adds the CLI's own index (`tern ls --json`) and makes `tern process`
+    reject any other id, exactly as the real CLI answers a pane id it does not
+    know; session_ids adds the Tern session ids the same index reports. Index
+    calls never consume a payload.
     """
     state = os.path.join(directory, "state")
     os.makedirs(state, exist_ok=True)
@@ -278,6 +289,22 @@ def fake_tern(
         write_file(state, "sleep-second", sleep_second.encode("ascii"))
     if second_script:
         write_file(state, "second-script", second_script.encode("utf-8"))
+    index_lines = ""
+    if pane_ids is not None or session_ids is not None:
+        sessions = [int(value) for value in session_ids or []] or [1]
+        blocks = [{"id": int(pane)} for pane in pane_ids or []]
+        index = {"sessions": [{"id": sessions[0], "tabs": [{"id": 2, "blocks": blocks}]}]}
+        index["sessions"].extend({"id": value, "tabs": []} for value in sessions[1:])
+        write_file(state, "cli-index.json", json.dumps(index).encode("utf-8"))
+        index_lines = 'if [ "$1" = "ls" ]; then cat "$state/cli-index.json"; exit 0; fi\n'
+        if pane_ids is not None:
+            write_file(state, "pane-ids", ("\n".join(pane_ids) + "\n").encode("ascii"))
+            index_lines += (
+                'if [ "$1" = "process" ] && ! grep -q -x -- "$2" "$state/pane-ids"; then\n'
+                '  echo "tern process: no block is called `$2`" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+            )
     script = os.path.join(directory, "bin", "tern")
     os.makedirs(os.path.dirname(script), exist_ok=True)
     last = len(payloads) - 1
@@ -285,6 +312,7 @@ def fake_tern(
         handle.write(
             "#!/bin/sh\n"
             'state="%s"\n'
+            "%s"
             'calls=$(cat "$state/calls" 2>/dev/null || echo 0)\n'
             'echo $((calls + 1)) > "$state/calls"\n'
             'if [ "$calls" -ge %d ]; then calls=%d; fi\n'
@@ -293,7 +321,7 @@ def fake_tern(
             '  [ -f "$state/sleep-second" ] && sleep "$(cat "$state/sleep-second")"\n'
             '  [ -f "$state/second-script" ] && sh "$state/second-script"\n'
             "fi\n"
-            'cat "$state/payload-$calls.json"\n' % (state, last, last, last)
+            'cat "$state/payload-$calls.json"\n' % (state, index_lines, last, last, last)
         )
     os.chmod(script, 0o755)
     return os.path.join(directory, "bin")
@@ -1080,6 +1108,216 @@ def case_discover_cold(root: str) -> None:
         stop_forked(daemon)
 
 
+def case_pane_id_spaces(root: str) -> None:
+    """Tern numbers one pane and one Tern session in two id spaces: the window's
+    own block id, and the daemon's tagged id that the CLI and TERN_PANE report.
+    A binding must resolve either way, must never merge two different tagged ids
+    that share a block id, and must refuse an ambiguous block id instead of
+    choosing a conversation."""
+    env = env_for(root)
+    home = os.path.join(root, "home")
+    span = 1 << 44
+    block = "7009386627079"
+    first = str(6 * span + int(block))  # one open pane
+    second = str(5 * span + int(block))  # a different open pane sharing that block id
+
+    def cli(tag: str, panes: list[str], sessions: list[str] | None = None, payloads: list[dict] | None = None) -> dict:
+        """An env whose `tern` answers with that index, and rejects other ids."""
+        bin_dir = fake_tern(
+            os.path.join(root, "bin-" + tag), payloads or [{"foreground": {}}], pane_ids=panes, session_ids=sessions
+        )
+        return discover_env(root, home, bin_dir)
+
+    both = cli("both", [first, second])  # two open panes share one block id
+    only_first = cli("first", [first])  # only the first pane is open
+    only_second = cli("second", [second])  # only the second is open
+
+    # Two different panes, one block id: an exact tagged id binds its own pane's
+    # conversation only, and the shared block id itself chooses neither.
+    call({"op": "touch", "session": session(SESSION_A, first, "win-a", "tern-a", "Alpha", root)}, env)
+    call({"op": "touch", "session": session(SESSION_B, second, "win-a", "tern-b", "Beta", root)}, env)
+    # A row recorded under the shared block id is still no owner to choose.
+    call({"op": "touch", "session": session(SESSION_C, block, "win-a", "tern-c", "Gamma", root)}, env)
+    code, listed_first = call({"op": "list", "pane_id": first, "window_key": "win-a"}, both)
+    _, listed_second = call({"op": "list", "pane_id": second, "window_key": "win-a"}, both)
+    code, listed_bare = call({"op": "list", "pane_id": block, "window_key": "win-a"}, both)
+    check(
+        "an exact tagged id binds its own pane and never the one sharing its block id",
+        code == 0
+        and (listed_first.get("session") or {}).get("id") == SESSION_A
+        and (listed_second.get("session") or {}).get("id") == SESSION_B,
+        "%s vs %s" % (listed_first.get("session"), listed_second.get("session")),
+    )
+    check(
+        "a block id two open panes share binds neither and says so",
+        code == 0
+        and listed_bare.get("session") is None
+        and listed_bare.get("items") == []
+        and any("more than one open pane" in entry.get("error", "") for entry in listed_bare.get("errors") or []),
+        str(listed_bare),
+    )
+
+    # One pane that is the only one with its block id: the window's id and the
+    # daemon's tagged id are that same pane, whichever recorded the binding.
+    call({"op": "touch", "session": session(SESSION_C, second, "win-c", "tern-c", "Gamma", root)}, env)
+    _, via_tagged = call({"op": "list", "pane_id": second, "window_key": "win-c"}, only_second)
+    _, via_block = call({"op": "list", "pane_id": block, "window_key": "win-c"}, only_second)
+    check(
+        "a daemon id and the block id of one proven pane bind the same session",
+        (via_tagged.get("session") or {}).get("id") == SESSION_C
+        and (via_block.get("session") or {}).get("id") == SESSION_C,
+        "%s vs %s" % (via_tagged.get("session"), via_block.get("session")),
+    )
+
+    _, closed_tagged = call({"op": "list", "pane_id": first, "window_key": "win-a"}, only_second)
+    check(
+        "a closed tagged pane keeps its exact binding instead of adopting a replacement",
+        (closed_tagged.get("session") or {}).get("id") == SESSION_A,
+        str(closed_tagged.get("session")),
+    )
+
+    # Repeated OMP sessions on one exact pane: the newest binding of that pane is
+    # still the current one, asked for by either of its ids.
+    call({"op": "touch", "session": session(SESSION_A, first, "win-d", "tern-a", "Alpha", root)}, env)
+    call({"op": "touch", "session": session(SESSION_B, first, "win-d", "tern-b", "Beta", root)}, env)
+    _, newest_tagged = call({"op": "list", "pane_id": first, "window_key": "win-d"}, only_first)
+    _, newest_block = call({"op": "list", "pane_id": block, "window_key": "win-d"}, only_first)
+    check(
+        "the newest binding of one exact pane wins in either id space",
+        (newest_tagged.get("session") or {}).get("id") == SESSION_B
+        and (newest_block.get("session") or {}).get("id") == SESSION_B,
+        "%s vs %s" % (newest_tagged.get("session"), newest_block.get("session")),
+    )
+    call({"op": "touch", "session": session(SESSION_A, block, "win-d", "tern-a", "Alpha", root)}, env)
+    _, rebound = call({"op": "list", "pane_id": first, "window_key": "win-d"}, only_first)
+    check(
+        "a later binding under the window's block id becomes that pane's current one",
+        (rebound.get("session") or {}).get("id") == SESSION_A,
+        str(rebound.get("session")),
+    )
+
+    _, unknown = call({"op": "list", "pane_id": "123456789012"}, both)
+    check(
+        "a pane id no binding names binds nothing",
+        unknown.get("session") is None and unknown.get("items") == [],
+        str(unknown.get("session")),
+    )
+
+    # A Tern session id is tagged the same way. One session recorded in both
+    # spaces is one workspace; two distinct tagged sessions that share a block id
+    # must never merge into one.
+    tern_block = "9590661971979"
+    tern_tagged = str(5 * span + int(tern_block))
+    tern_other = str(3 * span + int(tern_block))
+    shot = write_file(root, "workspace.png", make_png((5, 6, 7)))
+    register(env, session(SESSION_A, first, "win-w", tern_tagged, "Gamma", root), [{"path": shot, "source": "viewed"}])
+    register(env, session(SESSION_B, second, "win-w", tern_block, "Delta", root), [{"path": shot, "source": "viewed"}])
+    _, workspace = call(
+        {"op": "list", "scope": "workspace", "tern_session_id": tern_block, "window_key": "win-w"},
+        cli("ws-one", [first], [tern_tagged]),
+    )
+    check(
+        "a workspace spans both id spaces of one proven Tern session",
+        workspace.get("total") == 2
+        and {item["session_id"] for item in workspace.get("items") or []} == {SESSION_A, SESSION_B},
+        str(workspace.get("total")),
+    )
+
+    register(env, session(SESSION_C, second, "win-w", tern_other, "Epsilon", root), [{"path": shot, "source": "viewed"}])
+    two_sessions = cli("ws-two", [first], [tern_tagged, tern_other])
+    _, split = call(
+        {"op": "list", "scope": "workspace", "tern_session_id": tern_block, "window_key": "win-w"}, two_sessions
+    )
+    check(
+        "a session block id two open sessions share merges neither",
+        split.get("total") == 1 and {item["session_id"] for item in split.get("items") or []} == {SESSION_B},
+        str(split.get("total")),
+    )
+    _, tagged_only = call(
+        {"op": "list", "scope": "workspace", "tern_session_id": tern_tagged, "window_key": "win-w"}, two_sessions
+    )
+    check(
+        "an exact tagged session id keeps its own workspace",
+        tagged_only.get("total") == 1
+        and {item["session_id"] for item in tagged_only.get("items") or []} == {SESSION_A},
+        str(tagged_only.get("total")),
+    )
+    _, closed_workspace = call(
+        {"op": "list", "scope": "workspace", "tern_session_id": tern_other, "window_key": "win-w"},
+        cli("ws-replacement", [first], [tern_tagged]),
+    )
+    check(
+        "a closed tagged workspace does not adopt another daemon's session",
+        {item["session_id"] for item in closed_workspace.get("items") or []} == {SESSION_C},
+        str(closed_workspace),
+    )
+
+
+    # Discovery reaches the pane through the CLI's own index: the window's block
+    # id is not one the CLI knows, so the pane it reports for it is the only id
+    # discovery may name.
+    store = os.path.join(home, ".omp", "agent", "sessions")
+    work = os.path.join(root, "work")
+    os.makedirs(work, exist_ok=True)
+    transcript = omp_transcript(os.path.join(store, "conv"), "2026-02-01T00-00-00-000Z", SESSION_C, work, [])
+    holder = hold_open(root, "spaces", [transcript])
+    payload = {"foreground": {"pid": holder.pid, "name": "18.10.4", "argv": ["omp"], "cwd": work}}
+
+    def discover(pane: str, cli_env: dict):
+        request = {
+            "op": "discover",
+            "pane_id": pane,
+            "window_key": "win-e",
+            "host": socket.gethostname(),
+            "cwd": work,
+            "label": "Chat",
+            "tern_session_id": "tern-e",
+        }
+        return call(request, cli_env)
+
+    try:
+        code, res = discover(block, cli("disc", [first], payloads=[payload] * 2))
+        bound = (res or {}).get("session") or {}
+        check(
+            "discover resolves a window's block id through the CLI's pane index",
+            code == 0 and bound.get("id") == SESSION_C and bound.get("pane_id") == first,
+            str(res),
+        )
+        _, gallery = call({"op": "list", "pane_id": block, "window_key": "win-e"}, only_first)
+        check(
+            "the discovered conversation is the gallery's binding for that pane",
+            (gallery.get("session") or {}).get("id") == SESSION_C,
+            str(gallery.get("session")),
+        )
+
+        code, res = discover(block, cli("disc-ambiguous", [first, second], payloads=[payload] * 2))
+        check(
+            "two panes behind one block id bind nothing",
+            code == 0 and (res or {}).get("session") is None and (res or {}).get("items") == [],
+            str(res),
+        )
+        code, res = discover(first, cli("disc-replacement", [second], payloads=[payload] * 2))
+        check(
+            "a closed tagged pane cannot discover a replacement with the same block id",
+            code == 0 and (res or {}).get("session") is None and (res or {}).get("items") == [],
+            str(res),
+        )
+        code, res = discover("999999999999", cli("disc-absent", [first], payloads=[payload] * 2))
+        check(
+            "a pane id the CLI does not report binds nothing",
+            code == 0 and (res or {}).get("session") is None and (res or {}).get("items") == [],
+            str(res),
+        )
+        _, after = call({"op": "list", "pane_id": block, "window_key": "win-e"}, only_first)
+        check(
+            "a refused discovery leaves the pane's binding alone",
+            (after.get("session") or {}).get("id") == SESSION_C,
+            str(after.get("session")),
+        )
+    finally:
+        stop_holder(holder)
+
+
 def case_touch_identity(root: str) -> None:
     env = env_for(root)
     code, res = call({"op": "touch", "session": {"id": "fixture-conversation-a", "host": "fixture", "pane_id": "5"}}, env)
@@ -1479,6 +1717,7 @@ def main() -> int:
         ("transcript backfill", case_backfill),
         ("discover live conversation", case_discover),
         ("discover cold-resumed conversation", case_discover_cold),
+        ("pane id spaces", case_pane_id_spaces),
         ("binding order", case_binding_order),
         ("legacy migration", case_legacy_migration),
         ("shared initialization", case_shared_initialization),

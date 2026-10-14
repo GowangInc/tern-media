@@ -4,7 +4,7 @@ A native, session-scoped media gallery for [Stencil Tern](https://stencil.so/ter
 
 ## Install
 
-Requires Tern with native plugin blocks and the window-plugin API, Python 3.10+, and OMP for automatic conversation capture. The native interface is verified against Tern 0.7.0.
+Requires Tern with native plugin blocks and the window-plugin API, Python 3.10+, and OMP for automatic conversation capture. The native interface is verified against Tern 0.8.3.
 
 ```sh
 git clone https://github.com/GowangInc/tern-media.git
@@ -92,7 +92,9 @@ Schema creation and migration run once inside a serialized transaction. Normal o
 
 If Tern reports `focus exceeded 50 ms`, `title exceeded 50 ms`, or another plugin hook budget error, it disables the affected handler until **Reload plugins** in the command palette. `tern plugin list` reporting `ready` describes package loading, not whether every window handler is still enabled.
 
-An intermittent hook timeout was observed on Tern 0.7.0 after the initial isolated verification. Its cause remains unresolved: a tiny diagnostic handler also timed out when loaded alongside Media, but succeeded in a separate minimal window. Reloading restores disabled handlers; it is recovery, not a permanent fix. The safety limit is unchanged.
+The 0.8.3 recovery removes operational timer chains, uses Tern's native block-opening API, and includes the required surface region in gallery events. Large pane IDs returned by the window API do not round-trip through its numeric pane/layout methods; the gallery therefore uses exact string event targets and the native CLI for moving, floating, and docking, preserving terminal focus. Closed panes left in window snapshots are checked against the daemon before reuse. Reload plugins after updating; terminals do not need restarting.
+
+Conversation and workspace IDs are resolved through the CLI's live index, never by choosing the newest unrelated archive. Ambiguous IDs fail closed; a stale tagged ID cannot adopt another daemon's pane. The backend also checks Tern's installation link directories when the window's PATH omits the CLI. The observed ID encoding is an upstream compatibility dependency, not a documented Tern API.
 
 ## Checks
 
@@ -101,9 +103,11 @@ python3 selftest.py
 bun omp-extension.ts --self-check
 ```
 
-The backend check exercises real JSON subprocess requests, retained bytes/versioning, conversation/workspace isolation, imports, watches, transcript/blob backfill, live-process and cold-resume discovery, stale-pointer rejection, and input boundaries. Bun checks automatic historical import, delayed-media availability, and binding order in an isolated store and child-process environment. Check fixtures are retained in temporary directories printed by the commands. Bun is only needed for the standalone extension check, not for the Python store.
+The backend check exercises real JSON subprocess requests, retained bytes/versioning, conversation/workspace isolation, imports, watches, transcript/blob backfill, live-process and cold-resume discovery, stale-pointer rejection, tagged/window ID aliases, ambiguity and replacement rejection, and input boundaries. Bun checks automatic historical import, delayed-media availability, and binding order in an isolated store and child-process environment. Check fixtures are retained in temporary directories printed by the commands. Bun is only needed for the standalone extension check, not for the Python store.
 
 Native checks isolate Tern configuration, daemon, media/Flow stores, and OMP state. Generated fixture images exercise gallery opening, existing-session import, Escape closure and persistence, comparison, tagging/search, import/watch, pin persistence, typed saved-file opening, floating/docking, and narrow/light/dark layouts. Original-view checks load 3200×2400 and 1800×900 retained images through keyboard and native links, including a comparison original after the source is overwritten. An actual OMP image read verifies the capture path separately.
+
+The 0.8.3 recovery was also exercised in a live, large-ID window: opening/reopening, duplicate-open reuse, retained-image viewing, refresh, floating/docking with preserved focus, and following another conversation across tabs. Headless `tern serve` does not load native plugin blocks; use an isolated real window for plugin checks.
 
 ## License and acknowledgements
 
